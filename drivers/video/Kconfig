@@ -60,6 +60,8 @@ config VIDEO_I2C_RETRY_NUM
 
 source "drivers/video/Kconfig.esp32_dvp"
 
+source "drivers/video/Kconfig.esp32_dvp_jpeg"
+
 source "drivers/video/Kconfig.mcux_csi"
 
 source "drivers/video/Kconfig.mcux_mipi_csi2rx"

@@ -1000,6 +1000,7 @@ static int ov2640_init_controls(const struct device *dev)
 
 static int ov2640_init(const struct device *dev)
 {
+	LOG_DBG("Initializing ov2640 camera driver");
 	int ret = 0;
 	/* set default/init format SVGA RGB565 */
 	struct video_format fmt = {
@@ -1009,6 +1010,7 @@ static int ov2640_init(const struct device *dev)
 	};
 
 #if DT_INST_NODE_HAS_PROP(0, reset_gpios)
+	LOG_INF("Resetting ov2640 camera");
 	const struct ov2640_config *cfg = dev->config;
 
 	ret = gpio_pin_configure_dt(&cfg->reset_gpio, GPIO_OUTPUT_ACTIVE);

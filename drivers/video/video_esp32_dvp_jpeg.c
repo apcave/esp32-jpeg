@@ -60,6 +60,7 @@ struct video_esp32_config {
 	uint8_t invert_pclk;
 	uint8_t invert_hsync;
 	uint8_t invert_vsync;
+	bool dma_dynamic_mode;
 };
 
 struct video_esp32_data {
@@ -70,7 +71,9 @@ struct video_esp32_data {
 	bool is_streaming;
 	struct k_fifo fifo_in;
 	struct k_fifo fifo_out;
-	struct dma_block_config dma_blocks[CONFIG_DMA_ESP32_MAX_DESCRIPTOR_NUM];
+	struct dma_block_config dma_block;
+	size_t desc_count;
+	size_t max_desc_count;
 #ifdef CONFIG_POLL
 	struct k_poll_signal *signal_out;
 #endif
@@ -102,10 +105,27 @@ static int video_esp32_reload_dma(struct video_esp32_data *data)
 	return 0;
 }
 
+static size_t find_jpeg_eoi(const uint8_t *buffer, size_t max_size)
+{
+	/* Search for JPEG End Of Image marker (0xFF 0xD9) */
+	for (size_t i = 0; i < max_size - 1; i++) {
+		if (buffer[i] == 0xFF && buffer[i + 1] == 0xD9) {
+			/* Return position after EOI marker */
+			return i + 2;
+		}
+	}
+	/* If no EOI found, return the full buffer size */
+	LOG_WRN("JPEG EOI marker not found in buffer");
+	return max_size;
+}
+
 void video_esp32_dma_rx_done(const struct device *dev, void *user_data, uint32_t channel,
 			     int status)
 {
 	struct video_esp32_data *data = user_data;
+	const struct video_esp32_config *cfg = data->config;
+
+	LOG_DBG("Received video frame DMA callback");
 
 	if (status == DMA_STATUS_BLOCK) {
 		LOG_DBG("received block");
@@ -124,6 +144,24 @@ void video_esp32_dma_rx_done(const struct device *dev, void *user_data, uint32_t
 		return;
 	}
 
+	struct video_format fmt;
+	if ( video_get_format(cfg->source_dev, &fmt) ) {
+		LOG_ERR("Failed to get format from source");
+		return;
+	}	
+
+	if (fmt.pixelformat == VIDEO_PIX_FMT_JPEG) {
+		/* Find actual JPEG size by searching for EOI marker */
+		size_t actual_size = find_jpeg_eoi((uint8_t *)data->active_vbuf->buffer,
+						data->active_vbuf->bytesused);
+		data->active_vbuf->bytesused = actual_size;
+
+		LOG_DBG("JPEG frame complete: %zu bytes", actual_size);
+	} 
+
+	/* Stop DMA to prevent overwriting if still running */
+	dma_stop(cfg->dma_dev, cfg->rx_dma_channel);
+
 	k_fifo_put(&data->fifo_out, data->active_vbuf);
 	VIDEO_ESP32_RAISE_OUT_SIG_IF_ENABLED(VIDEO_BUF_DONE)
 	data->active_vbuf = k_fifo_get(&data->fifo_in, K_NO_WAIT);
@@ -136,15 +174,16 @@ void video_esp32_dma_rx_done(const struct device *dev, void *user_data, uint32_t
 	video_esp32_reload_dma(data);
 }
 
+
 static int video_esp32_set_stream(const struct device *dev, bool enable, enum video_buf_type type)
 {
 	const struct video_esp32_config *cfg = dev->config;
 	struct video_esp32_data *data = dev->data;
 	struct dma_status dma_status = {0};
 	struct dma_config dma_cfg = {0};
-	struct dma_block_config *dma_block_iter = data->dma_blocks;
-	uint32_t buffer_size = 0;
 	int error = 0;
+
+	LOG_DBG("video_esp32_set_stream enable=%d type=%d", enable, type);
 
 	if (!enable) {
 		LOG_DBG("Stop streaming");
@@ -189,27 +228,26 @@ static int video_esp32_set_stream(const struct device *dev, bool enable, enum vi
 		return -EAGAIN;
 	}
 
-	buffer_size = data->active_vbuf->bytesused;
-	memset(data->dma_blocks, 0, sizeof(data->dma_blocks));
-	for (int i = 0; i < CONFIG_DMA_ESP32_MAX_DESCRIPTOR_NUM; ++i) {
-		dma_block_iter->dest_address =
-			(uint32_t)data->active_vbuf->buffer + (i * VIDEO_ESP32_DMA_BUFFER_MAX_SIZE);
-		if (buffer_size < VIDEO_ESP32_DMA_BUFFER_MAX_SIZE) {
-			dma_block_iter->block_size = buffer_size;
-			dma_block_iter->next_block = NULL;
-			dma_cfg.block_count = i + 1;
-			break;
-		}
-		dma_block_iter->block_size = VIDEO_ESP32_DMA_BUFFER_MAX_SIZE;
-		dma_block_iter->next_block = dma_block_iter + 1;
-		dma_block_iter++;
-		buffer_size -= VIDEO_ESP32_DMA_BUFFER_MAX_SIZE;
-	}
+	data->dma_block.source_address = (uint32_t)data->active_vbuf->buffer;
+	LOG_DBG("DMA buffer address: %p", data->dma_block.source_address );
 
-	if (dma_block_iter->next_block) {
-		LOG_ERR("Not enough descriptors available. Increase "
-			"CONFIG_DMA_ESP32_MAX_DESCRIPTOR_NUM");
-		return -ENOBUFS;
+	data->dma_block.dynamic_alloc = cfg->dma_dynamic_mode ? 1 : 0;
+
+	if( cfg->dma_dynamic_mode ) {
+		LOG_WRN("Using dynamic DMA descriptor mode");
+
+		LOG_DBG("active buffer bytesused: %u", data->active_vbuf->bytesused);
+		if ( data->active_vbuf->bytesused ) {
+			LOG_DBG("Matrix format: %u bytes",  data->active_vbuf->bytesused);
+			data->dma_block.block_size =  data->active_vbuf->bytesused;
+		} else {
+			LOG_DBG("JPEG format variable image size");
+			/* The block_size can be larger than the maximum DMA burst size */
+			data->dma_block.block_size = data->active_vbuf->size;			
+		}
+
+	} else {
+		LOG_WRN("Using static DMA descriptor mode");
 	}
 
 	dma_cfg.channel_direction = PERIPHERAL_TO_MEMORY;
@@ -217,8 +255,10 @@ static int video_esp32_set_stream(const struct device *dev, bool enable, enum vi
 	dma_cfg.user_data = data;
 	dma_cfg.dma_slot = SOC_GDMA_TRIG_PERIPH_CAM0;
 	dma_cfg.complete_callback_en = 1;
-	dma_cfg.head_block = &data->dma_blocks[0];
+	dma_cfg.head_block = &data->dma_block;
 
+
+	
 	error = dma_config(cfg->dma_dev, cfg->rx_dma_channel, &dma_cfg);
 	if (error) {
 		LOG_ERR("Unable to configure DMA (%d)", error);
@@ -255,6 +295,7 @@ static int video_esp32_get_caps(const struct device *dev, struct video_caps *cap
 static int video_esp32_get_fmt(const struct device *dev, struct video_format *fmt)
 {
 	const struct video_esp32_config *cfg = dev->config;
+	struct video_esp32_data *data = dev->data;
 	int ret = 0;
 
 	LOG_DBG("Get format");
@@ -266,7 +307,7 @@ static int video_esp32_get_fmt(const struct device *dev, struct video_format *fm
 	}
 
 	fmt->pitch = fmt->width * video_bits_per_pixel(fmt->pixelformat) / BITS_PER_BYTE;
-
+	data->video_format = *fmt;
 	return 0;
 }
 
@@ -294,6 +335,8 @@ static int video_esp32_enqueue(const struct device *dev, struct video_buffer *vb
 
 	vbuf->bytesused = data->video_format.pitch * data->video_format.height;
 	vbuf->line_offset = 0;
+
+	LOG_DBG("Enqueue vbuf=%p, size=%u, bytesused=%u", vbuf, vbuf->size, vbuf->bytesused);
 
 	k_fifo_put(&data->fifo_in, vbuf);
 
@@ -376,15 +419,33 @@ static int video_esp32_init(const struct device *dev)
 	const struct video_esp32_config *cfg = dev->config;
 	struct video_esp32_data *data = dev->data;
 
+	LOG_DBG("Initializing ESP32 JPEG video driver");
+
 	k_fifo_init(&data->fifo_in);
 	k_fifo_init(&data->fifo_out);
 	data->config = cfg;
+
+	/* Initialize descriptor management */
+	data->dma_block.dynamic_alloc = 1;
+	data->desc_count = 0;
+	data->max_desc_count = 0;
+
 	video_esp32_cam_ctrl_init(dev);
 
 	if (!device_is_ready(cfg->dma_dev)) {
 		LOG_ERR("DMA device not ready");
 		return -ENODEV;
 	}
+
+	data->video_format.type = VIDEO_BUF_TYPE_OUTPUT;
+	if (video_get_format(dev, &data->video_format)) {
+		LOG_ERR("Unable to retrieve video format");
+		return -EIO;
+	}
+
+	LOG_DBG("Camera - Current format: %s %ux%u, pitch %u",
+		VIDEO_FOURCC_TO_STR(data->video_format.pixelformat), data->video_format.width, data->video_format.height, data->video_format.pitch);	
+
 
 	return 0;
 }
@@ -423,6 +484,7 @@ static const struct video_esp32_config esp32_config = {
 	.cam_clk = DT_INST_PROP_OR(0, cam_clk, 0),
 	.clock_dev = DEVICE_DT_GET(DT_INST_CLOCKS_CTLR(0)),
 	.clock_subsys = (clock_control_subsys_t)DT_INST_CLOCKS_CELL(0, offset),
+	.dma_dynamic_mode = DT_INST_PROP_OR(0, dma_dynamic_mode, false),
 };
 
 static struct video_esp32_data esp32_data = {0};

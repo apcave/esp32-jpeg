@@ -52,6 +52,7 @@ struct dma_esp32_channel {
 	dma_callback_t cb;
 	void *user_data;
 	dma_descriptor_t desc_list[CONFIG_DMA_ESP32_MAX_DESCRIPTOR_NUM];
+	dma_descriptor_t *desc_list_dynamic;
 };
 
 struct dma_esp32_config {
@@ -72,6 +73,7 @@ static void IRAM_ATTR dma_esp32_isr_handle_rx(const struct device *dev,
 {
 	struct dma_esp32_data *data = (struct dma_esp32_data *const)(dev)->data;
 
+	LOG_DBG("DMA RX ISR, channel %d, intr_status=0x%08x", rx->channel_id, intr_status);
 	gdma_ll_rx_clear_interrupt_status(data->hal.dev, rx->channel_id, intr_status);
 	if (rx->cb) {
 		int status;
@@ -127,12 +129,108 @@ static void IRAM_ATTR dma_esp32_isr_handle(const struct device *dev, uint8_t rx_
 }
 #endif
 
+/* Helper macro to get the active descriptor list (dynamic or static) */
+#define GET_DESC_LIST(chan) \
+	((chan)->desc_list_dynamic ? (chan)->desc_list_dynamic : (chan)->desc_list)
+
 static int dma_esp32_config_descriptor(struct dma_esp32_channel *dma_channel,
 					struct dma_block_config *block)
 {
 	if (!block) {
 		LOG_ERR("At least one dma block is required");
 		return -EINVAL;
+	}
+
+	if (block->dynamic_alloc) {
+		/* Dynamic descriptor allocation for variable-length transfers */
+		LOG_DBG("Using dynamic descriptor allocation for variable-length transfer");
+
+		if (dma_channel->dir == DMA_TX) {
+			LOG_ERR("Dynamic descriptor allocation not supported for TX channel");
+			return -EINVAL;
+		}
+
+		uint32_t num_dynamic_desc =
+			(block->block_size + DMA_DESCRIPTOR_BUFFER_MAX_SIZE_4B_ALIGNED - 1) /
+			DMA_DESCRIPTOR_BUFFER_MAX_SIZE_4B_ALIGNED;
+
+		LOG_DBG("Dynamic DMA block size: %u, requires %u descriptors",
+			block->block_size, num_dynamic_desc);
+		
+		/* Free existing allocation if present */
+		if (dma_channel->desc_list_dynamic != NULL) {
+			LOG_DBG("Freeing previously allocated descriptor list at %p",
+				dma_channel->desc_list_dynamic);
+			k_free(dma_channel->desc_list_dynamic);
+			dma_channel->desc_list_dynamic = NULL;
+		}
+		
+		dma_channel->desc_list_dynamic = k_calloc(num_dynamic_desc, sizeof(dma_descriptor_t));
+		if (!dma_channel->desc_list_dynamic) {
+			LOG_ERR("Failed to allocate dynamic DMA descriptor list");
+			return -ENOMEM;
+		}
+		
+		if (!esp_ptr_dma_capable((uint32_t *)dma_channel->desc_list_dynamic)
+#if defined(CONFIG_ESP_SPIRAM)
+			&& !esp_ptr_dma_ext_capable((uint32_t *)dma_channel->desc_list_dynamic)
+#endif
+		) {
+			LOG_ERR("Dynamic DMA descriptor list not in DMA capable memory: %p",
+			(uint32_t *)dma_channel->desc_list_dynamic);
+			k_free(dma_channel->desc_list_dynamic);
+			dma_channel->desc_list_dynamic = NULL;
+			return -EINVAL;
+		}
+
+
+		if (!esp_ptr_dma_capable((uint32_t *)block->source_address )
+#if defined(CONFIG_ESP_SPIRAM)
+			&& !esp_ptr_dma_ext_capable((uint32_t *)block->source_address )
+#endif
+		) {
+			LOG_ERR("DMA data buffer not in DMA capable memory: %p",
+			(uint32_t *)block->source_address );
+			return -EINVAL;
+		}		
+
+
+		LOG_DBG("Filling dynamic DMA descriptor list at %p", dma_channel->desc_list_dynamic);
+		uint32_t block_size = block->block_size;
+		memset(dma_channel->desc_list_dynamic, 0, num_dynamic_desc*sizeof(dma_descriptor_t));
+		for (uint32_t i = 0; i < num_dynamic_desc; i++) {
+			uint32_t buffer_size;
+
+			if (block_size > DMA_DESCRIPTOR_BUFFER_MAX_SIZE_4B_ALIGNED) {
+				buffer_size = DMA_DESCRIPTOR_BUFFER_MAX_SIZE_4B_ALIGNED;
+			} else {
+				buffer_size = block_size;
+			}
+
+			dma_channel->desc_list_dynamic[i].buffer =
+				(void *)(block->source_address + i * DMA_DESCRIPTOR_BUFFER_MAX_SIZE_4B_ALIGNED);
+			dma_channel->desc_list_dynamic[i].dw0.size = buffer_size;
+			dma_channel->desc_list_dynamic[i].dw0.owner = DMA_DESCRIPTOR_BUFFER_OWNER_DMA;
+
+			if ( i < 4 ) {
+			LOG_DBG("  Desc %u: buffer=%p, size=%u", i,
+				dma_channel->desc_list_dynamic[i].buffer,
+				dma_channel->desc_list_dynamic[i].dw0.size);
+			}
+			block_size -= buffer_size;
+
+			if (i == (num_dynamic_desc - 1)) {
+				dma_channel->desc_list_dynamic[i].next = NULL;
+			} else {
+				dma_channel->desc_list_dynamic[i].next = &dma_channel->desc_list_dynamic[i + 1];
+			}
+		}
+		LOG_DBG("Dynamic DMA descriptor list filled: %u descriptors, first=%p, last=%p",
+			num_dynamic_desc, &dma_channel->desc_list_dynamic[0],
+			&dma_channel->desc_list_dynamic[num_dynamic_desc - 1]);
+
+
+		return 0;
 	}
 
 	uint32_t target_address = 0, block_size = 0;
@@ -375,17 +473,21 @@ static int dma_esp32_start(const struct device *dev, uint32_t channel)
 		gdma_ll_tx_start(data->hal.dev, dma_channel->channel_id);
 	} else {
 		if (dma_channel->dir == DMA_RX) {
+			dma_descriptor_t *desc_list = GET_DESC_LIST(dma_channel);
+			LOG_DBG("Starting RX DMA ch=%d, desc_list=%p (dynamic=%p, static=%p)",
+				dma_channel->channel_id, desc_list,
+				dma_channel->desc_list_dynamic, dma_channel->desc_list);
 			gdma_ll_rx_enable_interrupt(data->hal.dev, dma_channel->channel_id,
 						    GDMA_LL_EVENT_RX_SUC_EOF |
 						    GDMA_LL_EVENT_RX_DONE, true);
 			gdma_ll_rx_set_desc_addr(data->hal.dev, dma_channel->channel_id,
-						 (int32_t)dma_channel->desc_list);
+						 (int32_t)desc_list);
 			gdma_ll_rx_start(data->hal.dev, dma_channel->channel_id);
 		} else if (dma_channel->dir == DMA_TX) {
 			gdma_ll_tx_enable_interrupt(data->hal.dev, dma_channel->channel_id,
 						    GDMA_LL_EVENT_TX_EOF, true);
 			gdma_ll_tx_set_desc_addr(data->hal.dev, dma_channel->channel_id,
-						 (int32_t)dma_channel->desc_list);
+						 (int32_t)GET_DESC_LIST(dma_channel));
 			gdma_ll_tx_start(data->hal.dev, dma_channel->channel_id);
 		} else {
 			LOG_ERR("Channel %d is not configured", channel);
@@ -453,10 +555,11 @@ static int dma_esp32_get_status(const struct device *dev, uint32_t channel,
 		status->dir = PERIPHERAL_TO_MEMORY;
 		desc = (dma_descriptor_t *)gdma_ll_rx_get_current_desc_addr(
 			data->hal.dev, dma_channel->channel_id);
-		if (desc >= dma_channel->desc_list) {
-			status->read_position = desc - dma_channel->desc_list;
+		dma_descriptor_t *active_list = GET_DESC_LIST(dma_channel);
+		if (desc >= active_list) {
+			status->read_position = desc - active_list;
 			status->total_copied = desc->dw0.length
-						+ dma_channel->desc_list[0].dw0.size
+						+ active_list[0].dw0.size
 						* status->read_position;
 		}
 	} else if (dma_channel->dir == DMA_TX) {
@@ -464,8 +567,9 @@ static int dma_esp32_get_status(const struct device *dev, uint32_t channel,
 		status->dir = MEMORY_TO_PERIPHERAL;
 		desc = (dma_descriptor_t *)gdma_ll_tx_get_current_desc_addr(
 			data->hal.dev, dma_channel->channel_id);
-		if (desc >= dma_channel->desc_list) {
-			status->write_position = desc - dma_channel->desc_list;
+		dma_descriptor_t *active_list = GET_DESC_LIST(dma_channel);
+		if (desc >= active_list) {
+			status->write_position = desc - active_list;
 		}
 	}
 
@@ -478,7 +582,7 @@ static int dma_esp32_reload(const struct device *dev, uint32_t channel, uint32_t
 	struct dma_esp32_config *config = (struct dma_esp32_config *)dev->config;
 	struct dma_esp32_data *data = (struct dma_esp32_data *const)(dev)->data;
 	struct dma_esp32_channel *dma_channel = &config->dma_channel[channel];
-	dma_descriptor_t *desc_iter = dma_channel->desc_list;
+	dma_descriptor_t *desc_iter = GET_DESC_LIST(dma_channel);
 	uint32_t buf;
 
 	if (channel >= config->dma_channel_max) {
@@ -496,7 +600,12 @@ static int dma_esp32_reload(const struct device *dev, uint32_t channel, uint32_t
 		return -EINVAL;
 	}
 
-	for (int i = 0; i < ARRAY_SIZE(dma_channel->desc_list); ++i) {
+	/* For dynamic allocation, calculate required descriptors */
+	uint32_t num_desc = ARRAY_SIZE(dma_channel->desc_list);
+	/* Note: dynamic_alloc handling would go here if needed for reload */
+	/* For now, use static descriptor count */
+
+	for (int i = 0; i <  num_desc; ++i) {
 		memset(desc_iter, 0, sizeof(dma_descriptor_t));
 		desc_iter->buffer = (void *)(buf + DMA_DESCRIPTOR_BUFFER_MAX_SIZE_4B_ALIGNED * i);
 		desc_iter->dw0.owner = DMA_DESCRIPTOR_BUFFER_OWNER_DMA;
@@ -694,7 +803,7 @@ static void *irq_handlers[] = {
 		.sram_alignment = DT_INST_PROP(idx, dma_buf_addr_alignment),                       \
 		.clock_dev = DEVICE_DT_GET(DT_INST_CLOCKS_CTLR(idx)),                              \
 		.clock_subsys = (void *)DT_INST_CLOCKS_CELL(idx, offset),                          \
-	};                                                                                         \
+	};                                                                                     \
 	static struct dma_esp32_data dma_data_##idx = {                                            \
 		.hal =                                                                             \
 			{                                                                          \

@@ -160,8 +160,20 @@ struct dma_block_config {
 	 * - 0b1 source request postponed until destination request happens
 	 */
 	uint16_t  flow_control_mode : 1;
+	/**
+	 * Dynamic descriptor allocation mode
+	 *
+	 * - 0b0 use pre-allocated static descriptor list
+	 * - 0b1 dynamically allocate descriptors based on block_size
+	 *
+	 * Used for variable-length transfers where the size is not known at
+	 * compile time (e.g., compressed video frames). When set, the DMA
+	 * driver may allocate descriptors dynamically to accommodate the
+	 * actual transfer size.
+	 */
+	uint16_t  dynamic_alloc :      1;
 
-	uint16_t  _reserved :          3;
+	uint16_t  _reserved :          2;
 };
 
 /** The DMA callback event has occurred at the completion of a transfer list */

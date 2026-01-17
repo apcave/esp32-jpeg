@@ -48,3 +48,7 @@ properties:
   cam-clk:
     type: int
     description: camera clock frequency
+
+  dma-dynamic-mode:
+    type: boolean
+    description: enable dynamic dma descriptor mode for large frame sizes 

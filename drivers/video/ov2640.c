@@ -502,6 +502,12 @@ static int ov2640_write_reg(const struct i2c_dt_spec *spec, uint8_t reg_addr, ui
 {
 	uint8_t tries = 3;
 
+	k_sleep(K_MSEC(1000)); /* Delay to ensure camera is ready */
+
+	LOG_DBG("I2C Address: 0x%x", spec->addr);
+	LOG_DBG("I2C Bus: %s", spec->bus->name);
+	LOG_DBG("Write 0x%x to 0x%x", value, reg_addr);
+
 	/**
 	 * It rarely happens that the camera does not respond with ACK signal.
 	 * In that case it usually responds on 2nd try but there is a 3rd one
@@ -998,6 +1004,9 @@ static int ov2640_init_controls(const struct device *dev)
 
 static int ov2640_init(const struct device *dev)
 {
+	/* Add power-up delay before attempting I2C communication */
+	k_sleep(K_MSEC(1000));
+
 
 #if DT_INST_NODE_HAS_PROP(0, pwdn_gpios) || DT_INST_NODE_HAS_PROP(0, reset_gpios)
 	const struct ov2640_config *cfg = dev->config;

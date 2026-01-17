@@ -2,8 +2,12 @@ board:
   name: xiao_esp32s3
   full_name: XIAO ESP32S3
   vendor: seeed
-  socs:
+  socs: 
   - name: esp32s3
     variants:
-    - name: 'sense'
-      cpucluster: 'procpu'
+    - name: appcpu
+      cpucluster: appcpu
+    - name: procpu
+      cpucluster: procpu
+    - name: sense
+      cpucluster: procpu

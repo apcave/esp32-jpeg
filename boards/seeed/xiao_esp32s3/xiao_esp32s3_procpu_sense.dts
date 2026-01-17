@@ -7,6 +7,7 @@
 /dts-v1/;
 #include "xiao_esp32s3_procpu_common.dtsi"
 #include <espressif/partitions_0x0_amp.dtsi>
+#include "xiao_esp32s3-pinctrl.dtsi"
 
 / {
 	model = "Seeed Xiao ESP32S3 PROCPU Sense";
@@ -28,7 +29,6 @@
 		reg = <0x30>;
 		status = "okay";
 		clock-rate-control = <0x80>;
-
 		port {
 			ov2640_ep_out: endpoint {
 				remote-endpoint-label = "dvp_ep_in";
@@ -41,22 +41,23 @@
 	status = "okay";
 };
 
-&lcd_cam {
-	status = "okay";
-	pinctrl-0 = <&lcd_cam_default>;
-	pinctrl-names = "default";
-};
-
 &lcd_cam_dvp {
 	status = "okay";
 	cam-clk = <10000000>;
 	source = <&ov2640>;
-
 	port {
 		dvp_ep_in: endpoint {
 			remote-endpoint-label = "ov2640_ep_out";
 		};
 	};
+};
+
+&lcd_cam {
+	status = "okay";
+	pinctrl-0 = <&lcd_cam_default>;
+	pinctrl-names = "default";
+	dmas = <&dma 2>;
+	dma-names = "rx";
 };
 
 &spi2 {
@@ -67,13 +68,11 @@
 		compatible = "zephyr,sdhc-spi-slot";
 		reg = <0>;
 		status = "okay";
-
 		mmc {
 			compatible = "zephyr,sdmmc-disk";
 			disk-name = "SD";
 			status = "okay";
 		};
-
 		spi-max-frequency = <20000000>;
 	};
 };

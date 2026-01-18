@@ -87,7 +87,7 @@ static int video_esp32_reload_dma(struct video_esp32_data *data)
 	}
 
 	ret = dma_reload(cfg->dma_dev, cfg->rx_dma_channel, 0, (uint32_t)data->active_vbuf->buffer,
-			 data->active_vbuf->bytesused);
+			 data->active_vbuf->size);
 	if (ret) {
 		LOG_ERR("Unable to reload DMA (%d)", ret);
 		return ret;
@@ -133,6 +133,15 @@ void video_esp32_dma_rx_done(const struct device *dev, void *user_data, uint32_t
 		VIDEO_ESP32_RAISE_OUT_SIG_IF_ENABLED(VIDEO_BUF_ERROR)
 		return;
 	}
+
+	struct dma_status dma_status = {0};
+	dma_get_status(data->config->dma_dev, data->config->rx_dma_channel, &dma_status);
+	if (dma_status.busy) {
+		LOG_ERR("Rx DMA Channel %d is busy", data->config->rx_dma_channel);
+	}
+	LOG_INF("Rx Total copied: %d, read position: %d", dma_status.total_copied, dma_status.read_position);
+
+	LOG_WRN("Reloading DMA for next frame");
 	video_esp32_reload_dma(data);
 }
 
@@ -189,7 +198,7 @@ static int video_esp32_set_stream(const struct device *dev, bool enable, enum vi
 		return -EAGAIN;
 	}
 
-	buffer_size = data->active_vbuf->bytesused;
+	buffer_size = data->active_vbuf->size;
 	memset(data->dma_blocks, 0, sizeof(data->dma_blocks));
 	for (int i = 0; i < CONFIG_DMA_ESP32_MAX_DESCRIPTOR_NUM; ++i) {
 		dma_block_iter->dest_address =

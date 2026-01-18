@@ -496,7 +496,8 @@ static int dma_esp32_reload(const struct device *dev, uint32_t channel, uint32_t
 		return -EINVAL;
 	}
 
-	for (int i = 0; i < ARRAY_SIZE(dma_channel->desc_list); ++i) {
+	int i;
+	for ( i = 0; i < CONFIG_DMA_ESP32_MAX_DESCRIPTOR_NUM; ++i) {
 		memset(desc_iter, 0, sizeof(dma_descriptor_t));
 		desc_iter->buffer = (void *)(buf + DMA_DESCRIPTOR_BUFFER_MAX_SIZE_4B_ALIGNED * i);
 		desc_iter->dw0.owner = DMA_DESCRIPTOR_BUFFER_OWNER_DMA;
@@ -518,7 +519,7 @@ static int dma_esp32_reload(const struct device *dev, uint32_t channel, uint32_t
 		desc_iter += 1;
 	}
 
-	if (desc_iter->next) {
+	if ( i >= CONFIG_DMA_ESP32_MAX_DESCRIPTOR_NUM ) {
 		memset(desc_iter, 0, sizeof(dma_descriptor_t));
 		LOG_ERR("Not enough DMA descriptors. Increase CONFIG_DMA_ESP32_MAX_DESCRIPTOR_NUM");
 		return -EINVAL;

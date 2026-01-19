@@ -8,6 +8,7 @@
 #define DT_DRV_COMPAT espressif_esp32_lcd_cam
 
 #include <soc/gdma_channel.h>
+#include <soc.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/clock_control.h>
 #include <zephyr/drivers/clock_control/esp32_clock_control.h>
@@ -15,6 +16,7 @@
 #include <zephyr/drivers/dma/dma_esp32.h>
 #include <zephyr/drivers/pinctrl.h>
 #include <zephyr/drivers/video.h>
+#include <zephyr/drivers/video-controls.h>
 #include <zephyr/drivers/interrupt_controller/intc_esp32.h>
 #include <zephyr/kernel.h>
 #include <hal/cam_hal.h>
@@ -28,6 +30,7 @@ LOG_MODULE_REGISTER(video_esp32_lcd_cam, CONFIG_VIDEO_LOG_LEVEL);
 
 #define VIDEO_ESP32_DMA_BUFFER_MAX_SIZE 4095
 #define VIDEO_ESP32_VSYNC_MASK          0x04
+
 
 #ifdef CONFIG_POLL
 #define VIDEO_ESP32_RAISE_OUT_SIG_IF_ENABLED(result)                                               \
@@ -60,6 +63,9 @@ struct video_esp32_config {
 	uint8_t invert_pclk;
 	uint8_t invert_hsync;
 	uint8_t invert_vsync;
+	int irq_source;
+	int irq_priority;
+	int irq_flags;
 };
 
 struct video_esp32_data {
@@ -70,11 +76,156 @@ struct video_esp32_data {
 	bool is_streaming;
 	struct k_fifo fifo_in;
 	struct k_fifo fifo_out;
+	struct video_buffer *reload_on_vsync;
 	struct dma_block_config dma_blocks[CONFIG_DMA_ESP32_MAX_DESCRIPTOR_NUM];
 #ifdef CONFIG_POLL
 	struct k_poll_signal *signal_out;
 #endif
 };
+
+static int video_esp32_reload_dma(struct video_esp32_data *data);
+
+static int get_jpeg_size(struct video_buffer *vbuf)
+{
+	uint8_t *buffer = (uint8_t *)vbuf->buffer;
+	size_t max_size = vbuf->size;
+	size_t jpeg_start = (size_t) - 1;
+	size_t jpeg_end = (size_t) - 1;
+	size_t non_zero_count = 0;
+	
+	/* Count non-zero bytes */
+	for (size_t i = 0; i < max_size; i++) {
+		if (buffer[i] != 0) {
+			non_zero_count++;
+		}
+	}
+	LOG_INF("Non-zero bytes in buffer: %zu / %zu", non_zero_count, max_size);
+	
+	/* Find JPEG Start of Image marker (0xFFD8) */
+	for (size_t i = 0; i < max_size - 1; i++) {
+		if (buffer[i] == 0xFF && buffer[i + 1] == 0xD8) {
+			jpeg_start = i;
+			LOG_INF("Found SOI at offset %zu", i);
+			break;
+		}
+	}
+
+	if (jpeg_start == (size_t)-1) {
+		LOG_ERR("JPEG SOI marker (0xFFD8) not found");
+		jpeg_start = 0;  /* Use full buffer */
+	}
+	
+	/* Check for critical JPEG markers */
+	bool found_sos = false;
+	bool found_sof = false;
+	bool found_dqt = false;
+	bool found_dht = false;
+	size_t sos_offset = 0;
+	
+	for (size_t i = jpeg_start; i < max_size - 1; i++) {
+		if (buffer[i] == 0xFF) {
+			uint8_t marker = buffer[i + 1];
+			switch (marker) {
+			case 0xDA: /* SOS - Start of Scan */
+				found_sos = true;
+				sos_offset = i;
+				LOG_INF("Found SOS at offset %zu", i);
+				break;
+			case 0xC0: /* SOF0 - Start of Frame (Baseline DCT) */
+			case 0xC2: /* SOF2 - Start of Frame (Progressive DCT) */
+				found_sof = true;
+				LOG_INF("Found SOF at offset %zu", i);
+				break;
+			case 0xDB: /* DQT - Define Quantization Table */
+				found_dqt = true;
+				LOG_INF("Found DQT at offset %zu", i);
+				break;
+			case 0xC4: /* DHT - Define Huffman Table */
+				found_dht = true;
+				LOG_INF("Found DHT at offset %zu", i);
+				break;
+			}
+		}
+	}
+	
+	LOG_INF("JPEG markers: SOI=%d SOF=%d DQT=%d DHT=%d SOS=%d",
+		jpeg_start != (size_t)-1, found_sof, found_dqt, found_dht, found_sos);
+	
+	if (!found_sos) {
+		LOG_ERR("CRITICAL: SOS (Start of Scan) marker (0xFFDA) missing - JPEG incomplete!");
+	}
+	
+	/* Scan for JPEG End of Image marker (0xFFD9) starting from SOI */
+	for (size_t i = jpeg_start; i < max_size - 1; i++) {
+		if (buffer[i] == 0xFF && buffer[i + 1] == 0xD9) {
+			/* Found EOI marker, include the 2-byte marker */
+			jpeg_end = i + 2;
+			LOG_INF("Found EOI at offset %zu", i);
+			break;
+		}
+	}
+	
+	/* If no EOI found, use full buffer */
+	if (jpeg_end == (size_t)-1) {
+		LOG_ERR("JPEG EOI marker (0xFFD9) NOT FOUND - Image truncated!");
+		LOG_ERR("Buffer filled completely (%zu bytes) - INCREASE BUFFER SIZE!", max_size);
+		jpeg_end = max_size;
+	} else {
+		size_t unused_buffer = max_size - jpeg_end;
+		if (unused_buffer < (max_size / 10)) {
+			LOG_WRN("Buffer almost full! Only %zu bytes unused. Consider increasing buffer size.",
+				unused_buffer);
+		} else {
+			LOG_INF("Buffer utilization: %zu / %zu bytes (%.1f%%), %zu bytes free",
+				jpeg_end, max_size, (float)jpeg_end * 100.0f / max_size, unused_buffer);
+		}
+		
+		/* Check compressed image data size */
+		if (found_sos && sos_offset > 0) {
+			size_t compressed_data_size = (jpeg_end - 2) - (sos_offset + 2);
+			size_t header_size = sos_offset - jpeg_start;
+			LOG_INF("JPEG structure: Header=%zu bytes, Compressed data=%zu bytes",
+				header_size, compressed_data_size);
+			
+			/* Warn if compressed data seems too small */
+			if (compressed_data_size < 5000) {
+				LOG_ERR("Compressed data suspiciously small (%zu bytes) - frame may be cut short!",
+					compressed_data_size);
+				LOG_ERR("This suggests DMA/camera stopped early despite EOI being present");
+			}
+		}
+	}
+	
+	/* If JPEG doesn't start at beginning, move it */
+	if (jpeg_start > 0) {
+		size_t jpeg_size = jpeg_end - jpeg_start;
+		LOG_INF("Moving JPEG from offset %zu to beginning (%zu bytes)", jpeg_start, jpeg_size);
+		memmove(buffer, buffer + jpeg_start, jpeg_size);
+		return jpeg_size;
+	}
+	
+	return jpeg_end - jpeg_start;
+}
+
+
+static void IRAM_ATTR video_esp32_vsync_isr(const struct device *dev)
+{
+	struct video_esp32_data *data = dev->data;
+	uint32_t status = data->hal.hw->lc_dma_int_st.val;
+	
+	/* Check for VSYNC interrupt */
+	if (status & VIDEO_ESP32_VSYNC_MASK) {
+		/* Clear VSYNC interrupt */
+		data->hal.hw->lc_dma_int_clr.val = VIDEO_ESP32_VSYNC_MASK;
+		
+		/* Reload DMA for next frame on vsync */
+		if (data->reload_on_vsync) {
+			data->active_vbuf = data->reload_on_vsync;
+			video_esp32_reload_dma(data);
+			data->reload_on_vsync = NULL;
+		}
+	}
+}
 
 static int video_esp32_reload_dma(struct video_esp32_data *data)
 {
@@ -134,15 +285,8 @@ void video_esp32_dma_rx_done(const struct device *dev, void *user_data, uint32_t
 		return;
 	}
 
-	struct dma_status dma_status = {0};
-	dma_get_status(data->config->dma_dev, data->config->rx_dma_channel, &dma_status);
-	if (dma_status.busy) {
-		LOG_ERR("Rx DMA Channel %d is busy", data->config->rx_dma_channel);
-	}
-	LOG_INF("Rx Total copied: %d, read position: %d", dma_status.total_copied, dma_status.read_position);
-
-	LOG_WRN("Reloading DMA for next frame");
-	video_esp32_reload_dma(data);
+	//video_esp32_reload_dma(data);
+	data->reload_on_vsync = data->active_vbuf;
 }
 
 static int video_esp32_set_stream(const struct device *dev, bool enable, enum video_buf_type type)
@@ -294,6 +438,71 @@ static int video_esp32_set_fmt(const struct device *dev, struct video_format *fm
 
 	data->video_format = *fmt;
 
+	/* Query and log camera sensor settings */
+	struct video_control ctrl;
+	int ctrl_ret;
+	
+	LOG_INF("=== Camera Sensor Configuration ===");
+	
+	/* Check JPEG compression quality */
+	ctrl.id = VIDEO_CID_JPEG_COMPRESSION_QUALITY;
+	ctrl_ret = video_get_ctrl(cfg->source_dev, &ctrl);
+	if (ctrl_ret == 0) {
+		LOG_INF("JPEG Compression Quality: %d (0-63, higher=better)", ctrl.val);
+	} else {
+		LOG_WRN("JPEG Compression Quality: Not supported (ret=%d)", ctrl_ret);
+	}
+	
+	/* Check horizontal flip */
+	ctrl.id = VIDEO_CID_HFLIP;
+	ctrl_ret = video_get_ctrl(cfg->source_dev, &ctrl);
+	if (ctrl_ret == 0) {
+		LOG_INF("Horizontal Flip: %s", ctrl.val ? "ENABLED (may cause cropping)" : "disabled");
+	} else {
+		LOG_DBG("Horizontal Flip: Not readable (ret=%d)", ctrl_ret);
+	}
+	
+	/* Check vertical flip */
+	ctrl.id = VIDEO_CID_VFLIP;
+	ctrl_ret = video_get_ctrl(cfg->source_dev, &ctrl);
+	if (ctrl_ret == 0) {
+		LOG_INF("Vertical Flip: %s", ctrl.val ? "ENABLED (may cause cropping)" : "disabled");
+	} else {
+		LOG_DBG("Vertical Flip: Not readable (ret=%d)", ctrl_ret);
+	}
+	
+	/* Check test pattern */
+	ctrl.id = VIDEO_CID_TEST_PATTERN;
+	ctrl_ret = video_get_ctrl(cfg->source_dev, &ctrl);
+	if (ctrl_ret == 0) {
+		LOG_INF("Test Pattern: %s", ctrl.val ? "ENABLED" : "disabled");
+	} else {
+		LOG_DBG("Test Pattern: Not readable (ret=%d)", ctrl_ret);
+	}
+	
+	/* Check brightness */
+	ctrl.id = VIDEO_CID_BRIGHTNESS;
+	ctrl_ret = video_get_ctrl(cfg->source_dev, &ctrl);
+	if (ctrl_ret == 0) {
+		LOG_INF("Brightness: %d", ctrl.val);
+	}
+	
+	/* Check contrast */
+	ctrl.id = VIDEO_CID_CONTRAST;
+	ctrl_ret = video_get_ctrl(cfg->source_dev, &ctrl);
+	if (ctrl_ret == 0) {
+		LOG_INF("Contrast: %d", ctrl.val);
+	}
+	
+	/* Check saturation */
+	ctrl.id = VIDEO_CID_SATURATION;
+	ctrl_ret = video_get_ctrl(cfg->source_dev, &ctrl);
+	if (ctrl_ret == 0) {
+		LOG_INF("Saturation: %d", ctrl.val);
+	}
+	
+	LOG_INF("=== End Camera Configuration ===");
+
 	return 0;
 }
 
@@ -306,6 +515,13 @@ static int video_esp32_enqueue(const struct device *dev, struct video_buffer *vb
 
 	k_fifo_put(&data->fifo_in, vbuf);
 
+	if (data->active_vbuf == NULL && data->is_streaming) {
+		LOG_WRN("Attempting to restart DMA after enqueue");
+		data->reload_on_vsync = vbuf;
+		//data->active_vbuf = vbuf;
+		//video_esp32_reload_dma(data);
+	}
+
 	return 0;
 }
 
@@ -315,11 +531,17 @@ static int video_esp32_dequeue(const struct device *dev, struct video_buffer **v
 	struct video_esp32_data *data = dev->data;
 
 	*vbuf = k_fifo_get(&data->fifo_out, timeout);
-	LOG_DBG("Dequeue done, vbuf = %p", *vbuf);
+
+	/* For JPEG format, calculate actual size from buffer */
+	if (data->video_format.pixelformat == VIDEO_PIX_FMT_JPEG) {
+		size_t jpeg_size = get_jpeg_size((*vbuf));
+		(*vbuf)->bytesused = jpeg_size;
+	}
+
+	LOG_WRN("Dequeue done, vbuf = %p, bytesused %zu", *vbuf, (*vbuf)->bytesused);
 	if (*vbuf == NULL) {
 		return -EAGAIN;
 	}
-
 	return 0;
 }
 
@@ -395,6 +617,21 @@ static int video_esp32_init(const struct device *dev)
 		return -ENODEV;
 	}
 
+	/* Configure VSYNC interrupt */
+	int ret = esp_intr_alloc(cfg->irq_source,
+				 ESP_PRIO_TO_FLAGS(cfg->irq_priority) | 
+				 ESP_INT_FLAGS_CHECK(cfg->irq_flags) | ESP_INTR_FLAG_IRAM,
+				 (intr_handler_t)video_esp32_vsync_isr,
+				 (void *)dev,
+				 NULL);
+	if (ret != 0) {
+		LOG_ERR("Could not allocate vsync interrupt handler (%d)", ret);
+		return ret;
+	}
+
+	/* Enable VSYNC interrupt in hardware */
+	data->hal.hw->lc_dma_int_ena.val |= VIDEO_ESP32_VSYNC_MASK;
+
 	return 0;
 }
 
@@ -432,6 +669,9 @@ static const struct video_esp32_config esp32_config = {
 	.cam_clk = DT_INST_PROP_OR(0, cam_clk, 0),
 	.clock_dev = DEVICE_DT_GET(DT_INST_CLOCKS_CTLR(0)),
 	.clock_subsys = (clock_control_subsys_t)DT_INST_CLOCKS_CELL(0, offset),
+	.irq_source = DT_INST_IRQN(0),
+	.irq_priority = DT_INST_IRQ(0, priority),
+	.irq_flags = DT_INST_IRQ(0, flags),
 };
 
 static struct video_esp32_data esp32_data = {0};

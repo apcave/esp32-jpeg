@@ -22,6 +22,13 @@
 #include <hal/cam_hal.h>
 #include <hal/cam_ll.h>
 
+#include <hal/gdma_hal.h>
+#include <hal/gdma_ll.h>
+#include <soc/gdma_channel.h>
+#include <hal/dma_types.h>
+
+#include <zephyr/sys/crc.h>
+
 #include <zephyr/logging/log.h>
 
 #include "video_device.h"
@@ -84,6 +91,48 @@ struct video_esp32_data {
 };
 
 static int video_esp32_reload_dma(struct video_esp32_data *data);
+
+
+
+static void print_register_info(const volatile uint32_t* value, const char* label) {
+	char buffer[36]; // 32 bits + 4 spaces + null terminator
+	int index = 0;
+	uint32_t i = 32;
+
+    do {
+		i--;
+		if ((i+1) % 8 == 0 && i != 0) {
+			buffer[index] = ' '; // Optional: space every byte
+			index++;
+		}
+		buffer[index] = (*value & (1U << i)) ? '1' : '0';
+		index++;		
+	} while (i != 0 );
+	buffer[index] = '\0';
+    LOG_INF("val = 0b%s, addr = %p - Label: %s", buffer, value, label);
+}
+
+
+static void print_camera_registers(cam_hal_context_t *hal) {
+	
+	lcd_cam_lc_dma_int_ena_reg_t *lcd_cam_lc_dma_int_ena_reg = (lcd_cam_lc_dma_int_ena_reg_t *)&(hal->hw->lc_dma_int_ena.val);
+	lcd_cam_cam_ctrl_reg_t *cam_ctrl = (lcd_cam_cam_ctrl_reg_t *)&(hal->hw->cam_ctrl.val);
+	lcd_cam_cam_ctrl1_reg_t *cam_ctrl1 = (lcd_cam_cam_ctrl1_reg_t *)&(hal->hw->cam_ctrl1.val);
+	
+	LOG_ERR("Camera Registers at device %p", hal->hw);
+	print_register_info(&(lcd_cam_lc_dma_int_ena_reg->val), "lcd_cam_lc_dma_int_ena_reg");
+	print_register_info(&(cam_ctrl->val), "lcd_cam_cam_ctrl_reg");
+	print_register_info(&(cam_ctrl1->val), "lcd_cam_cam_ctrl1_reg");
+}
+
+static void print_gdma_registers(gdma_dev_t *gdma_dev, uint8_t channel) {
+	LOG_ERR("GDMA Registers for channel %d, at device %p", channel, gdma_dev);
+	print_register_info(&(gdma_dev->channel[channel].in.int_ena.val), "int_ena");
+	print_register_info(&(gdma_dev->channel[channel].in.conf0.val), "int_st");
+	print_register_info(&(gdma_dev->channel[channel].in.link.val), "in_link");
+}
+
+
 
 static int get_jpeg_size(struct video_buffer *vbuf)
 {
@@ -199,11 +248,18 @@ static int get_jpeg_size(struct video_buffer *vbuf)
 	/* If JPEG doesn't start at beginning, move it */
 	if (jpeg_start > 0) {
 		size_t jpeg_size = jpeg_end - jpeg_start;
-		LOG_INF("Moving JPEG from offset %zu to beginning (%zu bytes)", jpeg_start, jpeg_size);
+		LOG_ERR("JPEG Move disabled for debugging purposes.");
+		LOG_ERR("Moving JPEG from offset %zu to beginning (%zu bytes)", jpeg_start, jpeg_size);
 		memmove(buffer, buffer + jpeg_start, jpeg_size);
 		return jpeg_size;
 	}
 	
+    /* Calculate CRC32 of the JPEG data */
+    // size_t jpeg_size = jpeg_end - jpeg_start;
+    // uint32_t crc = crc32_ieee(buffer + jpeg_start, jpeg_size);
+    // LOG_INF("JPEG CRC32: 0x%08X (size: %zu bytes)", crc, jpeg_size);
+   
+
 	return jpeg_end - jpeg_start;
 }
 
@@ -212,18 +268,24 @@ static void IRAM_ATTR video_esp32_vsync_isr(const struct device *dev)
 {
 	struct video_esp32_data *data = dev->data;
 	uint32_t status = data->hal.hw->lc_dma_int_st.val;
-	
+
 	/* Check for VSYNC interrupt */
 	if (status & VIDEO_ESP32_VSYNC_MASK) {
 		/* Clear VSYNC interrupt */
 		data->hal.hw->lc_dma_int_clr.val = VIDEO_ESP32_VSYNC_MASK;
 		
+
+		LOG_WRN("VSYNC interrupt triggered");
 		/* Reload DMA for next frame on vsync */
 		if (data->reload_on_vsync) {
+			LOG_WRN("Reloading DMA on VSYNC");
 			data->active_vbuf = data->reload_on_vsync;
 			video_esp32_reload_dma(data);
 			data->reload_on_vsync = NULL;
 		}
+		
+		// get_jpeg_size(data->active_vbuf);
+		// memset(data->active_vbuf->buffer, 0, data->active_vbuf->size);		
 	}
 }
 
@@ -258,8 +320,15 @@ void video_esp32_dma_rx_done(const struct device *dev, void *user_data, uint32_t
 {
 	struct video_esp32_data *data = user_data;
 
+	//LOG_ERR("DMA RX done with status: %d", status);
+	//LOG_ERR("Should never occur because of circular DMA descriptors");
+
+	//get_jpeg_size(data->active_vbuf);
+	//memset(data->active_vbuf->buffer, 0, data->active_vbuf->size);	
+	//return;
+
 	if (status == DMA_STATUS_BLOCK) {
-		LOG_DBG("received block");
+		LOG_WRN("received block");
 		return;
 	}
 
@@ -274,6 +343,34 @@ void video_esp32_dma_rx_done(const struct device *dev, void *user_data, uint32_t
 		LOG_ERR("No video buffer available. Enque some buffers first.");
 		return;
 	}
+	//LOG_WRN("Reloading DMA for next frame");
+	// struct dma_esp32_config *config = (struct dma_esp32_config *)dev->config;
+	// struct dma_esp32_channel *dma_channel = &(config->dma_channel[channel]);	
+	// gdma_ll_rx_start(data->hal.hw, dma_channel->channel_id);
+
+	// const struct video_esp32_config *cfg = data->config;
+	// int ret = dma_reload(cfg->dma_dev, cfg->rx_dma_channel, 0, (uint32_t)data->active_vbuf->buffer,
+	// 		 data->active_vbuf->size);
+	// if (ret) {
+	// 	LOG_ERR("Unable to reload DMA (%d)", ret);
+	// 	return;
+	// }	
+
+	LOG_INF("GDMA ISR");
+	cam_hal_context_t* hal = &data->hal;
+	print_camera_registers(hal);	
+
+
+	// cam_ll_stop(hal->hw);
+    // cam_ll_reset(hal->hw);
+    // cam_ll_fifo_reset(hal->hw);
+    // cam_ll_start(hal->hw);
+	// lcd_cam_dev_t *dev_cam = (lcd_cam_dev_t *)hal->hw;
+	// dev_cam->cam_ctrl.cam_update = 1;
+
+	get_jpeg_size(data->active_vbuf);
+	LOG_WRN("End of GDMA ISR <--");
+	return;
 
 	k_fifo_put(&data->fifo_out, data->active_vbuf);
 	VIDEO_ESP32_RAISE_OUT_SIG_IF_ENABLED(VIDEO_BUF_DONE)
@@ -284,10 +381,13 @@ void video_esp32_dma_rx_done(const struct device *dev, void *user_data, uint32_t
 		VIDEO_ESP32_RAISE_OUT_SIG_IF_ENABLED(VIDEO_BUF_ERROR)
 		return;
 	}
+	
 
-	//video_esp32_reload_dma(data);
-	data->reload_on_vsync = data->active_vbuf;
+	video_esp32_reload_dma(data);
+	// data->reload_on_vsync = data->active_vbuf;
 }
+
+
 
 static int video_esp32_set_stream(const struct device *dev, bool enable, enum video_buf_type type)
 {
@@ -372,24 +472,76 @@ static int video_esp32_set_stream(const struct device *dev, bool enable, enum vi
 	dma_cfg.complete_callback_en = 1;
 	dma_cfg.head_block = &data->dma_blocks[0];
 
+	LOG_INF("Start the camera...");
+	if (video_stream_start(cfg->source_dev, type)) {
+		return -EIO;
+	}	
+
+	LOG_INF("Configure DMA...");
 	error = dma_config(cfg->dma_dev, cfg->rx_dma_channel, &dma_cfg);
 	if (error) {
 		LOG_ERR("Unable to configure DMA (%d)", error);
 		return error;
 	}
 
+	
+
+	LOG_INF("Starting DMA...");
 	error = dma_start(cfg->dma_dev, cfg->rx_dma_channel);
 	if (error) {
 		LOG_ERR("Unable to start DMA (%d)", error);
 		return error;
 	}
+	
+	cam_hal_context_t* hal = &data->hal;
+	print_camera_registers(hal);	
+
+
+	print_gdma_registers(0x6003f000, 1);
+	LOG_WRN("Alexanders hacking starts here");
+	// lcd_cam_lc_dma_int_ena_reg_t *lcd_cam_lc_dma_int_ena_reg = (lcd_cam_lc_dma_int_ena_reg_t *)&(hal->hw->lc_dma_int_ena.val);
+	// lcd_cam_cam_ctrl_reg_t *cam_ctrl = (lcd_cam_cam_ctrl_reg_t *)&(hal->hw->cam_ctrl.val);
+	// lcd_cam_cam_ctrl1_reg_t *cam_ctrl1 = (lcd_cam_cam_ctrl1_reg_t *)&(hal->hw->cam_ctrl1.val);
+	// lcd_cam_lc_dma_int_ena_reg->lcd_trans_done_int_ena.val = 0;
+
+	lcd_cam_dev_t *dev_cam = (lcd_cam_dev_t *)hal->hw;
+	dev_cam->lc_dma_int_ena.val = 0;
+	//dev_cam->lc_dma_int_ena.cam_vsync_int_ena = 0;
+	dev_cam->cam_ctrl.cam_vsync_filter_thres = 0x0003; // Reduce VSYNC filter threshold to 3 cycles
+	dev_cam->cam_ctrl.cam_vs_eof_en = 0;
+	dev_cam->cam_ctrl1.cam_rec_data_bytelen = 100000; // Hack to force read of byte length
+
+	dev_cam->cam_ctrl.cam_update = 1;
+
+	//k_sleep(K_MSEC(1000));
+	// printk("Camera interrupt control register: \n");
+	// print_binary(lcd_cam_lc_dma_int_ena_reg->val);
+	
+	// lcd_cam_lc_dma_int_ena_reg->cam_vsync_int_ena = 0;
+	// lcd_cam_lc_dma_int_ena_reg->cam_hs_int_ena = 0;
+
+	// lcd_cam_cam_ctrl_reg_t *cam_ctrl = (lcd_cam_cam_ctrl_reg_t *)&(data->hal.hw->cam_ctrl.val);
+	// cam_ctrl->cam_line_int_en = 0;
+	
+	// lcd_cam_cam_ctrl1_reg_t *cam_ctrl1 = (lcd_cam_cam_ctrl1_reg_t *)&(data->hal.hw->cam_ctrl1.val);
+	// LOG_INF("Reading %d bytes", cam_ctrl1->cam_rec_data_bytelen);
+	// cam_ctrl1->cam_rec_data_bytelen = 6000; // Hack to force read of byte length
+	// LOG_WRN("Alexanders hacking ends here");
+
+	LOG_WRN("Registers while initializing:");
+	print_camera_registers(&data->hal);	
 
 	cam_hal_start_streaming(&data->hal);
+	dev_cam->cam_ctrl.cam_update = 1;	
 
-	if (video_stream_start(cfg->source_dev, type)) {
-		return -EIO;
-	}
+
+
+
+
 	data->is_streaming = true;
+
+	LOG_WRN("Registers while running:");
+	print_camera_registers(&data->hal);
 
 	return 0;
 }
@@ -518,8 +670,8 @@ static int video_esp32_enqueue(const struct device *dev, struct video_buffer *vb
 	if (data->active_vbuf == NULL && data->is_streaming) {
 		LOG_WRN("Attempting to restart DMA after enqueue");
 		data->reload_on_vsync = vbuf;
-		//data->active_vbuf = vbuf;
-		//video_esp32_reload_dma(data);
+		// data->active_vbuf = vbuf;
+		// video_esp32_reload_dma(data);
 	}
 
 	return 0;
@@ -600,6 +752,13 @@ static void video_esp32_cam_ctrl_init(const struct device *dev)
 	cam_ll_enable_invert_de(data->hal.hw, cfg->invert_de);
 	cam_ll_enable_invert_vsync(data->hal.hw, cfg->invert_vsync);
 	cam_ll_enable_invert_hsync(data->hal.hw, cfg->invert_hsync);
+
+	LOG_ERR("Alex HAL CAM settings applied");
+	cam_ll_enable_vsync_filter(data->hal.hw, true);
+
+	//cam_ll_enable_stop_signal(data->hal.hw, false);
+
+
 }
 
 static int video_esp32_init(const struct device *dev)
@@ -629,7 +788,7 @@ static int video_esp32_init(const struct device *dev)
 		return ret;
 	}
 
-	/* Enable VSYNC interrupt in hardware */
+	// /* Enable VSYNC interrupt in hardware */
 	data->hal.hw->lc_dma_int_ena.val |= VIDEO_ESP32_VSYNC_MASK;
 
 	return 0;

@@ -67,11 +67,44 @@ struct dma_esp32_config {
 	clock_control_subsys_t clock_subsys;
 };
 
+static void print_register_info(const volatile uint32_t* value, const char* label) {
+	char buffer[36]; // 32 bits + 4 spaces + null terminator
+	int index = 0;
+	uint32_t i = 32;
+
+    do {
+		i--;
+		if ((i+1) % 8 == 0 && i != 0 && i != 31) {
+			buffer[index] = ' '; // Optional: space every byte
+			index++;
+		}
+		buffer[index] = (*value & (1U << i)) ? '1' : '0';
+		index++;		
+	} while (i != 0 );
+	buffer[index] = '\0';
+    LOG_INF("val = 0x%08x, 0b%s, addr = %p - Label: %s", *value, buffer, value, label);
+}
+
+static void print_gdma_registers(gdma_dev_t *gdma_dev, uint8_t channel) {
+	LOG_ERR("GDMA Registers for channel %d, at device %p", channel, gdma_dev);
+	print_register_info(&(gdma_dev->channel[channel].in.int_ena.val), "int_ena");
+	print_register_info(&(gdma_dev->channel[channel].in.int_st.val), "int_st");
+
+	print_register_info(&(gdma_dev->channel[channel].in.conf0.val), "conf0");
+	print_register_info(&(gdma_dev->channel[channel].in.link.val), "link");
+	print_register_info(&(gdma_dev->channel[channel].in.state.val), "state");
+
+	print_register_info(&(gdma_dev->channel[channel].in.suc_eof_des_addr), "suc_eof_des_addr");
+	print_register_info(&(gdma_dev->channel[channel].in.err_eof_des_addr), "err_eof_des_addr");
+	print_register_info(&(gdma_dev->channel[channel].in.dscr), "dscr");
+}
+
 static void IRAM_ATTR dma_esp32_isr_handle_rx(const struct device *dev,
 					      struct dma_esp32_channel *rx, uint32_t intr_status)
 {
 	struct dma_esp32_data *data = (struct dma_esp32_data *const)(dev)->data;
 
+	print_gdma_registers(data->hal.dev, rx->channel_id);
 	gdma_ll_rx_clear_interrupt_status(data->hal.dev, rx->channel_id, intr_status);
 	if (rx->cb) {
 		int status;
@@ -137,8 +170,8 @@ static int dma_esp32_config_descriptor(struct dma_esp32_channel *dma_channel,
 
 	uint32_t target_address = 0, block_size = 0;
 	dma_descriptor_t *desc_iter = dma_channel->desc_list;
-
-	for (int i = 0; i < CONFIG_DMA_ESP32_MAX_DESCRIPTOR_NUM; ++i) {
+	int i;
+	for ( i = 0; i < CONFIG_DMA_ESP32_MAX_DESCRIPTOR_NUM; ++i) {
 		if (block_size == 0) {
 			if (dma_channel->dir == DMA_TX) {
 				target_address = block->source_address;
@@ -183,12 +216,14 @@ static int dma_esp32_config_descriptor(struct dma_esp32_channel *dma_channel,
 
 		target_address += buffer_size;
 		block_size -= buffer_size;
+		// desc_iter->dw0.suc_eof = 1;
 
 		if (!block_size) {
 			if (block->next_block) {
 				block = block->next_block;
 			} else {
-				desc_iter->next = NULL;
+				desc_iter->next = dma_channel->desc_list; // Circular list
+				desc_iter->dw0.suc_eof = 1;
 				if (dma_channel->dir == DMA_TX) {
 					desc_iter->dw0.suc_eof = 1;
 				}
@@ -200,7 +235,7 @@ static int dma_esp32_config_descriptor(struct dma_esp32_channel *dma_channel,
 		desc_iter += 1;
 	}
 
-	if (desc_iter->next) {
+	if (i >= CONFIG_DMA_ESP32_MAX_DESCRIPTOR_NUM) {
 		memset(dma_channel->desc_list, 0, sizeof(dma_channel->desc_list));
 		LOG_ERR("Run out of DMA descriptors. Increase CONFIG_DMA_ESP32_MAX_DESCRIPTOR_NUM");
 		return -EINVAL;
@@ -376,8 +411,10 @@ static int dma_esp32_start(const struct device *dev, uint32_t channel)
 	} else {
 		if (dma_channel->dir == DMA_RX) {
 			gdma_ll_rx_enable_interrupt(data->hal.dev, dma_channel->channel_id,
-						    GDMA_LL_EVENT_RX_SUC_EOF |
-						    GDMA_LL_EVENT_RX_DONE, true);
+			 			    GDMA_LL_EVENT_RX_SUC_EOF |
+			 			    GDMA_LL_EVENT_RX_DONE, true);
+			// gdma_ll_rx_enable_interrupt(data->hal.dev, dma_channel->channel_id,
+			//  			    GDMA_LL_EVENT_RX_DONE, false);			
 			gdma_ll_rx_set_desc_addr(data->hal.dev, dma_channel->channel_id,
 						 (int32_t)dma_channel->desc_list);
 			gdma_ll_rx_start(data->hal.dev, dma_channel->channel_id);
@@ -485,6 +522,25 @@ static int dma_esp32_reload(const struct device *dev, uint32_t channel, uint32_t
 		LOG_ERR("Unsupported channel");
 		return -EINVAL;
 	}
+	LOG_INF("/\\ Reloading DMA channel %d", channel);
+	// gdma_ll_rx_reset_channel(data->hal.dev, dma_channel->channel_id);
+	// //gdma_ll_rx_enable_interrupt(data->hal.dev, dma_channel->channel_id, GDMA_LL_EVENT_RX_SUC_EOF | GDMA_LL_EVENT_RX_DONE, true);
+	// //gdma_ll_rx_clear_interrupt_status(data->hal.dev, dma_channel->channel_id, GDMA_LL_RX_EVENT_MASK);
+	// return 0;
+	//gdma_ll_rx_reset_channel(data->hal.dev, dma_channel->channel_id);
+
+	// struct dma_status status;
+	// dma_esp32_get_status(dev, channel, &status);
+	// LOG_INF("DMA status: busy=%d, read_pos=%d, total_copied=%d, write_pos=%d",
+	// 	status.busy, status.read_position, status.total_copied, status.write_position);
+
+	// // gdma_ll_rx_enable_interrupt(data->hal.dev, dma_channel->channel_id,
+	// // 				GDMA_LL_EVENT_RX_SUC_EOF |
+	// // 				GDMA_LL_EVENT_RX_DONE, true);
+	// // gdma_ll_rx_set_desc_addr(data->hal.dev, dma_channel->channel_id,
+	// // 				(int32_t)dma_channel->desc_list);
+	// gdma_ll_rx_restart(data->hal.dev, dma_channel->channel_id);
+	return 0;
 
 	if (dma_channel->dir == DMA_RX) {
 		gdma_ll_rx_reset_channel(data->hal.dev, dma_channel->channel_id);

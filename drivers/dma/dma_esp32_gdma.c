@@ -104,7 +104,6 @@ static void IRAM_ATTR dma_esp32_isr_handle_rx(const struct device *dev,
 {
 	struct dma_esp32_data *data = (struct dma_esp32_data *const)(dev)->data;
 
-	print_gdma_registers(data->hal.dev, rx->channel_id);
 	gdma_ll_rx_clear_interrupt_status(data->hal.dev, rx->channel_id, intr_status);
 	if (rx->cb) {
 		int status;
@@ -264,6 +263,7 @@ static int dma_esp32_config_rx(const struct device *dev, struct dma_esp32_channe
 		/*
 		 * RX channel burst mode depends on specific data alignment
 		 */
+		LOG_ERR("Enabling RX burst mode with alignment %d", config->sram_alignment);
 		gdma_ll_rx_enable_data_burst(data->hal.dev, dma_channel->channel_id,
 					     config->sram_alignment >= 4);
 		gdma_ll_rx_enable_descriptor_burst(data->hal.dev, dma_channel->channel_id,
@@ -506,17 +506,17 @@ static int dma_esp32_get_status(const struct device *dev, uint32_t channel,
 	}
 
 	
-	LOG_WRN("Current descriptor at %p: buffer=%p, size=%d, length=%d, owner=%d, EOF=%d, ERR_EOF=%d",
-		desc, desc->buffer, desc->dw0.size, desc->dw0.length, desc->dw0.owner, desc->dw0.suc_eof, desc->dw0.err_eof);	
+	// LOG_WRN("Current descriptor at %p: buffer=%p, size=%d, length=%d, owner=%d, EOF=%d, ERR_EOF=%d",
+	// 	desc, desc->buffer, desc->dw0.size, desc->dw0.length, desc->dw0.owner, desc->dw0.suc_eof, desc->dw0.err_eof);	
 
-	int cnt = 0;		
-	desc = dma_channel->desc_list;
-	while(desc) {
-		LOG_INF("Descriptor %d at %p: next %p, buffer=%p, size=%d, length=%d, owner=%d, EOF=%d, ERR_EOF=%d",
-			cnt, desc, desc->next, desc->buffer, desc->dw0.size, desc->dw0.length, desc->dw0.owner, desc->dw0.suc_eof, desc->dw0.err_eof);
-		desc = desc->next;
-		cnt++;
-	}
+	// int cnt = 0;		
+	// desc = dma_channel->desc_list;
+	// while(desc) {
+	// 	LOG_INF("Descriptor %d at %p: next %p, buffer=%p, size=%d, length=%d, owner=%d, EOF=%d, ERR_EOF=%d",
+	// 		cnt, desc, desc->next, desc->buffer, desc->dw0.size, desc->dw0.length, desc->dw0.owner, desc->dw0.suc_eof, desc->dw0.err_eof);
+	// 	desc = desc->next;
+	// 	cnt++;
+	// }
 
 	return 0;
 }
@@ -534,7 +534,7 @@ static int dma_esp32_reload(const struct device *dev, uint32_t channel, uint32_t
 		LOG_ERR("Unsupported channel");
 		return -EINVAL;
 	}
-	LOG_INF("/\\ Reloading DMA channel %d", channel);
+	// LOG_INF("/\\ Reloading DMA channel %d", channel);
 	// gdma_ll_rx_reset_channel(data->hal.dev, dma_channel->channel_id);
 	// //gdma_ll_rx_enable_interrupt(data->hal.dev, dma_channel->channel_id, GDMA_LL_EVENT_RX_SUC_EOF | GDMA_LL_EVENT_RX_DONE, true);
 	// //gdma_ll_rx_clear_interrupt_status(data->hal.dev, dma_channel->channel_id, GDMA_LL_RX_EVENT_MASK);
@@ -542,76 +542,76 @@ static int dma_esp32_reload(const struct device *dev, uint32_t channel, uint32_t
 	//gdma_ll_rx_reset_channel(data->hal.dev, dma_channel->channel_id);
 	//data->hal.dev->channel[dma_channel->channel_id].in.link.restart = 1;
 
-	struct dma_status status;
-	gdma_dev_t *gdma_dev = data->hal.dev;
-	dma_descriptor_t *desc_eof = gdma_dev->channel[dma_channel->channel_id].in.suc_eof_des_addr;
-	LOG_ERR("desc_eof addr=%p", desc_eof);
+	// struct dma_status status;
+	// gdma_dev_t *gdma_dev = data->hal.dev;
+	// dma_descriptor_t *desc_eof = gdma_dev->channel[dma_channel->channel_id].in.suc_eof_des_addr;
+	//LOG_ERR("desc_eof addr=%p", desc_eof);
 
-	dma_esp32_get_status(dev, channel, &status);
-	LOG_INF("DMA status: busy=%d, read_pos=%d, total_copied=%d, write_pos=%d",
-	status.busy, status.read_position, status.total_copied, status.write_position);
+	// dma_esp32_get_status(dev, channel, &status);
+	// LOG_INF("DMA status: busy=%d, read_pos=%d, total_copied=%d, write_pos=%d",
+	// status.busy, status.read_position, status.total_copied, status.write_position);
 
-	print_gdma_registers(gdma_dev, dma_channel->channel_id);
-
-
-	if (desc_eof) {
-		LOG_INF("Last completed descriptor at %p: buffer=%p, size=%d, length=%d, owner=%d, EOF=%d, ERR_EOF=%d",
-		desc_eof, desc_eof->buffer, desc_eof->dw0.size, desc_eof->dw0.length, desc_eof->dw0.owner, desc_eof->dw0.suc_eof, desc_eof->dw0.err_eof);
-	} else {
-		LOG_INF("No completed descriptor yet.");
-	}
-
-	if(1) {
-		static int reload_count = 0;
-		reload_count++;
-		LOG_INF("**** DMA Reload Count %d ****", reload_count);
-		if(reload_count >= 6) {
-			LOG_WRN("Stopping DMA channel %d", channel);
-			gdma_ll_rx_stop(gdma_dev, dma_channel->channel_id);
-			return 3;
-		}
-
-		dma_descriptor_t *desc_cur = (dma_descriptor_t *)gdma_ll_rx_get_current_desc_addr(
-			gdma_dev, dma_channel->channel_id);
-		if (desc_cur == 0) {
-			LOG_ERR("No current descriptor.");
-			return -EINVAL;
-		}
-
-		LOG_INF("Resetting the DMA channel FSM and FIFO buffers (Channel %d).", dma_channel->channel_id);
-		gdma_ll_rx_reset_channel(gdma_dev, dma_channel->channel_id);
-
-		if (1) {
-			LOG_INF("Setting the descriptor Current address %p (Channel %d).", desc_cur->next, dma_channel->channel_id);
-			gdma_ll_rx_set_desc_addr(gdma_dev, dma_channel->channel_id,
-							(int32_t)desc_cur->next);
-		}
-
-		if (0) {
-			LOG_INF("Setting the descriptor EOF address %p (Channel %d).", desc_eof->next, dma_channel->channel_id);
-			gdma_ll_rx_set_desc_addr(gdma_dev, dma_channel->channel_id,
-							(int32_t)desc_eof->next);
-		}
-
-		LOG_INF("Connecting the DMA channel to peripheral %d (Channel %d).",
-			dma_channel->periph_id, dma_channel->channel_id);
-		gdma_ll_rx_connect_to_periph(
-			gdma_dev, dma_channel->channel_id,
-			dma_channel->periph_id == SOC_GDMA_TRIG_PERIPH_M2M0 ? ESP_DMA_M2M_ON
-										: ESP_DMA_M2M_OFF,
-			dma_channel->periph_id == SOC_GDMA_TRIG_PERIPH_M2M0 ? ESP_DMA_M2M_ON
-										: dma_channel->periph_id);
+	// print_gdma_registers(gdma_dev, dma_channel->channel_id);
 
 
-		LOG_INF("Starting the DMA channel (Channel %d).", dma_channel->channel_id);
-		gdma_ll_rx_start(gdma_dev, dma_channel->channel_id);
+	// if (desc_eof) {
+	// 	LOG_INF("Last completed descriptor at %p: buffer=%p, size=%d, length=%d, owner=%d, EOF=%d, ERR_EOF=%d",
+	// 	desc_eof, desc_eof->buffer, desc_eof->dw0.size, desc_eof->dw0.length, desc_eof->dw0.owner, desc_eof->dw0.suc_eof, desc_eof->dw0.err_eof);
+	// } else {
+	// 	LOG_INF("No completed descriptor yet.");
+	// }
 
-		dma_esp32_get_status(dev, channel, &status);
-		LOG_INF("DMA status: busy=%d, read_pos=%d, total_copied=%d, write_pos=%d",
-		status.busy, status.read_position, status.total_copied, status.write_position);
-	}
+	// if(1) {
+	// 	// static int reload_count = 0;
+	// 	// reload_count++;
+	// 	// LOG_INF("**** DMA Reload Count %d ****", reload_count);
+	// 	// if(reload_count >= 6) {
+	// 	// 	LOG_WRN("Stopping DMA channel %d", channel);
+	// 	// 	gdma_ll_rx_stop(gdma_dev, dma_channel->channel_id);
+	// 	// 	return 3;
+	// 	// }
 
-	return 0;
+	// 	dma_descriptor_t *desc_cur = (dma_descriptor_t *)gdma_ll_rx_get_current_desc_addr(
+	// 		gdma_dev, dma_channel->channel_id);
+	// 	if (desc_cur == 0) {
+	// 		LOG_ERR("No current descriptor.");
+	// 		return -EINVAL;
+	// 	}
+
+	// 	LOG_INF("Resetting the DMA channel FSM and FIFO buffers (Channel %d).", dma_channel->channel_id);
+	// 	gdma_ll_rx_reset_channel(gdma_dev, dma_channel->channel_id);
+
+	// 	if (1) {
+	// 		LOG_INF("Setting the descriptor Current address %p (Channel %d).", desc_cur->next, dma_channel->channel_id);
+	// 		gdma_ll_rx_set_desc_addr(gdma_dev, dma_channel->channel_id,
+	// 						(int32_t)desc_cur->next);
+	// 	}
+
+	// 	if (0) {
+	// 		LOG_INF("Setting the descriptor EOF address %p (Channel %d).", desc_eof->next, dma_channel->channel_id);
+	// 		gdma_ll_rx_set_desc_addr(gdma_dev, dma_channel->channel_id,
+	// 						(int32_t)desc_eof->next);
+	// 	}
+
+	// 	LOG_INF("Connecting the DMA channel to peripheral %d (Channel %d).",
+	// 		dma_channel->periph_id, dma_channel->channel_id);
+	// 	gdma_ll_rx_connect_to_periph(
+	// 		gdma_dev, dma_channel->channel_id,
+	// 		dma_channel->periph_id == SOC_GDMA_TRIG_PERIPH_M2M0 ? ESP_DMA_M2M_ON
+	// 									: ESP_DMA_M2M_OFF,
+	// 		dma_channel->periph_id == SOC_GDMA_TRIG_PERIPH_M2M0 ? ESP_DMA_M2M_ON
+	// 									: dma_channel->periph_id);
+
+
+	// 	LOG_INF("Starting the DMA channel (Channel %d).", dma_channel->channel_id);
+	// 	gdma_ll_rx_start(gdma_dev, dma_channel->channel_id);
+
+	// 	dma_esp32_get_status(dev, channel, &status);
+	// 	LOG_INF("DMA status: busy=%d, read_pos=%d, total_copied=%d, write_pos=%d",
+	// 	status.busy, status.read_position, status.total_copied, status.write_position);
+	// }
+
+	// return 0;
 	// // gdma_ll_rx_enable_interrupt(data->hal.dev, dma_channel->channel_id,
 	// // 				GDMA_LL_EVENT_RX_SUC_EOF |
 	// // 				GDMA_LL_EVENT_RX_DONE, true);
@@ -657,6 +657,19 @@ static int dma_esp32_reload(const struct device *dev, uint32_t channel, uint32_t
 		LOG_ERR("Not enough DMA descriptors. Increase CONFIG_DMA_ESP32_MAX_DESCRIPTOR_NUM");
 		return -EINVAL;
 	}
+
+	gdma_ll_rx_set_desc_addr(data->hal.dev, dma_channel->channel_id,
+					(int32_t)dma_channel->desc_list);
+
+
+	gdma_ll_rx_connect_to_periph(
+		data->hal.dev, dma_channel->channel_id,
+		dma_channel->periph_id == SOC_GDMA_TRIG_PERIPH_M2M0 ? ESP_DMA_M2M_ON
+									: ESP_DMA_M2M_OFF,
+		dma_channel->periph_id == SOC_GDMA_TRIG_PERIPH_M2M0 ? ESP_DMA_M2M_ON
+									: dma_channel->periph_id);
+
+	gdma_ll_rx_start(data->hal.dev, dma_channel->channel_id);
 
 	return 0;
 }

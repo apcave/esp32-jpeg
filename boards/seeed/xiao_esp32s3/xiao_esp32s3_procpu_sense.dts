@@ -42,7 +42,7 @@
 
 &lcd_cam {
 	status = "okay";
-	cam-clk = <10000000>;
+	cam-clk = <5000000>;
 	pinctrl-0 = <&lcd_cam_default>;
 	pinctrl-names = "default";
 	source = <&ov2640>;

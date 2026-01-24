@@ -35,7 +35,7 @@
 
 LOG_MODULE_REGISTER(video_esp32_lcd_cam, CONFIG_VIDEO_LOG_LEVEL);
 
-#define VIDEO_ESP32_DMA_BUFFER_MAX_SIZE 4095
+#define VIDEO_ESP32_DMA_BUFFER_MAX_SIZE 4092
 #define VIDEO_ESP32_VSYNC_MASK          0x04
 
 
@@ -91,7 +91,7 @@ struct video_esp32_data {
 };
 
 static int video_esp32_reload_dma(struct video_esp32_data *data);
-
+static int video_esp32_set_stream(const struct device *dev, bool enable, enum video_buf_type type);
 
 
 static void print_register_info(const volatile uint32_t* value, const char* label) {
@@ -144,7 +144,7 @@ static int get_jpeg_size(struct video_buffer *vbuf)
 	
 	/* Count non-zero bytes */
 	for (size_t i = 0; i < max_size; i++) {
-		if (buffer[i] != 0) {
+		if (buffer[i] != 0xFF) {
 			non_zero_count++;
 		}
 	}
@@ -250,7 +250,7 @@ static int get_jpeg_size(struct video_buffer *vbuf)
 		size_t jpeg_size = jpeg_end - jpeg_start;
 		LOG_ERR("JPEG Move disabled for debugging purposes.");
 		LOG_ERR("Moving JPEG from offset %zu to beginning (%zu bytes)", jpeg_start, jpeg_size);
-		memmove(buffer, buffer + jpeg_start, jpeg_size);
+		//memmove(buffer, buffer + jpeg_start, jpeg_size);
 		return jpeg_size;
 	}
 	
@@ -262,7 +262,30 @@ static int get_jpeg_size(struct video_buffer *vbuf)
 
 	return jpeg_end - jpeg_start;
 }
+static int dma_esp32_get_status(gdma_dev_t *dev, uint32_t channel)
+{
+	dma_descriptor_t *desc;
+	struct dma_status status;
+	status.busy = !gdma_ll_rx_is_fsm_idle(dev, channel);
+	status.dir = PERIPHERAL_TO_MEMORY;
+	desc = (dma_descriptor_t *)gdma_ll_rx_get_current_desc_addr(
+		dev, channel);
+	
+	// if (desc >= dma_channel->desc_list) {
+	// 	status.read_position = desc - dma_channel->desc_list;
+	// 	status.total_copied = desc->dw0.length
+	// 				+ dma_channel->desc_list[0].dw0.size
+	// 				* status.read_position;
+	// }
+	if (status.busy) {
+		LOG_ERR("DMA is busy");
+	} else {
+		LOG_ERR("DMA is idle");
+	}
 
+	LOG_ERR("Descriptor %p, buffer pointer %p size %d, length: %d", desc, desc->buffer, desc->dw0.size, desc->dw0.length);
+	return 0;
+}
 
 static void IRAM_ATTR video_esp32_vsync_isr(const struct device *dev)
 {
@@ -275,16 +298,20 @@ static void IRAM_ATTR video_esp32_vsync_isr(const struct device *dev)
 		data->hal.hw->lc_dma_int_clr.val = VIDEO_ESP32_VSYNC_MASK;
 		
 
-		LOG_WRN("VSYNC interrupt triggered");
+		LOG_WRN("VSYNC interrupt triggered <--");
 		/* Reload DMA for next frame on vsync */
-		if (data->reload_on_vsync) {
-			LOG_WRN("Reloading DMA on VSYNC");
-			data->active_vbuf = data->reload_on_vsync;
-			video_esp32_reload_dma(data);
-			data->reload_on_vsync = NULL;
-		}
-		
-		// get_jpeg_size(data->active_vbuf);
+		// if (data->reload_on_vsync) {
+		// 	LOG_WRN("Reloading DMA on VSYNC");
+		// 	data->active_vbuf = data->reload_on_vsync;
+		// 	video_esp32_reload_dma(data);
+		// 	data->reload_on_vsync = NULL;
+		// }
+		video_esp32_reload_dma(data);
+		//dma_esp32_get_status(0x6003f000, 1);
+
+
+
+		get_jpeg_size(data->active_vbuf);
 		// memset(data->active_vbuf->buffer, 0, data->active_vbuf->size);		
 	}
 }
@@ -294,10 +321,10 @@ static int video_esp32_reload_dma(struct video_esp32_data *data)
 	const struct video_esp32_config *cfg = data->config;
 	int ret = 0;
 
-	if (data->active_vbuf == NULL) {
-		LOG_ERR("No video buffer available. Enqueue some buffers first.");
-		return -EAGAIN;
-	}
+	// if (data->active_vbuf == NULL) {
+	// 	LOG_ERR("No video buffer available. Enqueue some buffers first.");
+	// 	return -EAGAIN;
+	// }
 
 	ret = dma_reload(cfg->dma_dev, cfg->rx_dma_channel, 0, (uint32_t)data->active_vbuf->buffer,
 			 data->active_vbuf->size);
@@ -306,11 +333,11 @@ static int video_esp32_reload_dma(struct video_esp32_data *data)
 		return ret;
 	}
 
-	ret = dma_start(cfg->dma_dev, cfg->rx_dma_channel);
-	if (ret) {
-		LOG_ERR("Unable to start DMA (%d)", ret);
-		return ret;
-	}
+	// ret = dma_start(cfg->dma_dev, cfg->rx_dma_channel);
+	// if (ret) {
+	// 	LOG_ERR("Unable to start DMA (%d)", ret);
+	// 	return ret;
+	// }
 
 	return 0;
 }
@@ -343,18 +370,29 @@ void video_esp32_dma_rx_done(const struct device *dev, void *user_data, uint32_t
 		LOG_ERR("No video buffer available. Enque some buffers first.");
 		return;
 	}
-	//LOG_WRN("Reloading DMA for next frame");
-	// struct dma_esp32_config *config = (struct dma_esp32_config *)dev->config;
-	// struct dma_esp32_channel *dma_channel = &(config->dma_channel[channel]);	
-	// gdma_ll_rx_start(data->hal.hw, dma_channel->channel_id);
+	LOG_WRN("Reloading DMA for next frame");
+	const struct video_esp32_config *cfg = data->config;
+	int ret = dma_reload(cfg->dma_dev, cfg->rx_dma_channel, 0, (uint32_t)data->active_vbuf->buffer,
+			 data->active_vbuf->size);
 
-	// const struct video_esp32_config *cfg = data->config;
-	// int ret = dma_reload(cfg->dma_dev, cfg->rx_dma_channel, 0, (uint32_t)data->active_vbuf->buffer,
-	// 		 data->active_vbuf->size);
-	// if (ret) {
-	// 	LOG_ERR("Unable to reload DMA (%d)", ret);
-	// 	return;
-	// }	
+	if (ret == 3) {
+		k_fifo_put(&data->fifo_out, data->active_vbuf);
+		VIDEO_ESP32_RAISE_OUT_SIG_IF_ENABLED(VIDEO_BUF_DONE)
+		data->active_vbuf = k_fifo_get(&data->fifo_in, K_NO_WAIT);
+
+		if (data->active_vbuf == NULL) {
+			LOG_WRN("Frame dropped. No buffer available");
+			//VIDEO_ESP32_RAISE_OUT_SIG_IF_ENABLED(VIDEO_BUF_ERROR)
+			//video_esp32_set_stream(dev, false, VIDEO_BUF_TYPE_OUTPUT);
+		}		
+		return;
+	}
+
+	if (ret) {
+		LOG_ERR("Unable to reload DMA (%d)", ret);
+		get_jpeg_size(data->active_vbuf);
+		return;
+	}	
 
 	LOG_INF("GDMA ISR");
 	cam_hal_context_t* hal = &data->hal;
@@ -368,22 +406,34 @@ void video_esp32_dma_rx_done(const struct device *dev, void *user_data, uint32_t
 	// lcd_cam_dev_t *dev_cam = (lcd_cam_dev_t *)hal->hw;
 	// dev_cam->cam_ctrl.cam_update = 1;
 
-	get_jpeg_size(data->active_vbuf);
+	//get_jpeg_size(data->active_vbuf);
 	LOG_WRN("End of GDMA ISR <--");
-	return;
 
-	k_fifo_put(&data->fifo_out, data->active_vbuf);
-	VIDEO_ESP32_RAISE_OUT_SIG_IF_ENABLED(VIDEO_BUF_DONE)
-	data->active_vbuf = k_fifo_get(&data->fifo_in, K_NO_WAIT);
+	if( video_esp32_reload_dma(data) == 3 ) {
+		k_fifo_put(&data->fifo_out, data->active_vbuf);
+		VIDEO_ESP32_RAISE_OUT_SIG_IF_ENABLED(VIDEO_BUF_DONE)
+		data->active_vbuf = k_fifo_get(&data->fifo_in, K_NO_WAIT);
 
-	if (data->active_vbuf == NULL) {
-		LOG_WRN("Frame dropped. No buffer available");
-		VIDEO_ESP32_RAISE_OUT_SIG_IF_ENABLED(VIDEO_BUF_ERROR)
-		return;
+		if (data->active_vbuf == NULL) {
+			LOG_WRN("Frame dropped. No buffer available");
+			//VIDEO_ESP32_RAISE_OUT_SIG_IF_ENABLED(VIDEO_BUF_ERROR)
+			//video_esp32_set_stream(dev, false, VIDEO_BUF_TYPE_OUTPUT);
+			return;
+		}		
 	}
+	// k_fifo_put(&data->fifo_out, data->active_vbuf);
+	// VIDEO_ESP32_RAISE_OUT_SIG_IF_ENABLED(VIDEO_BUF_DONE)
+	// data->active_vbuf = k_fifo_get(&data->fifo_in, K_NO_WAIT);
+
+	// if (data->active_vbuf == NULL) {
+	// 	LOG_WRN("Frame dropped. No buffer available");
+	// 	//VIDEO_ESP32_RAISE_OUT_SIG_IF_ENABLED(VIDEO_BUF_ERROR)
+	// 	//video_esp32_set_stream(dev, false, VIDEO_BUF_TYPE_OUTPUT);
+	// 	return;
+	// }
 	
 
-	video_esp32_reload_dma(data);
+	
 	// data->reload_on_vsync = data->active_vbuf;
 }
 
@@ -400,21 +450,23 @@ static int video_esp32_set_stream(const struct device *dev, bool enable, enum vi
 	int error = 0;
 
 	if (!enable) {
-		LOG_DBG("Stop streaming");
+		LOG_WRN("Stop streaming");
 
-		if (video_stream_stop(cfg->source_dev, type)) {
-			return -EIO;
-		}
-
-		data->is_streaming = false;
+		cam_hal_stop_streaming(&data->hal);
+		
 		error = dma_stop(cfg->dma_dev, cfg->rx_dma_channel);
 		if (error) {
 			LOG_ERR("Unable to stop DMA (%d)", error);
 			return error;
 		}
 
-		cam_hal_stop_streaming(&data->hal);
+		if (video_stream_stop(cfg->source_dev, type)) {
+			return -EIO;
+		}		
 
+		
+
+		data->is_streaming = false;
 		return 0;
 	}
 
@@ -505,11 +557,12 @@ static int video_esp32_set_stream(const struct device *dev, bool enable, enum vi
 	// lcd_cam_lc_dma_int_ena_reg->lcd_trans_done_int_ena.val = 0;
 
 	lcd_cam_dev_t *dev_cam = (lcd_cam_dev_t *)hal->hw;
-	dev_cam->lc_dma_int_ena.val = 0;
-	//dev_cam->lc_dma_int_ena.cam_vsync_int_ena = 0;
-	dev_cam->cam_ctrl.cam_vsync_filter_thres = 0x0003; // Reduce VSYNC filter threshold to 3 cycles
+	//dev_cam->lc_dma_int_ena.val = 0;
+	dev_cam->lc_dma_int_ena.cam_vsync_int_ena = 0;
+	//dev_cam->cam_ctrl.cam_vsync_filter_thres = 0x0003; // Reduce VSYNC filter threshold to 3 cycles
+	
 	dev_cam->cam_ctrl.cam_vs_eof_en = 0;
-	dev_cam->cam_ctrl1.cam_rec_data_bytelen = 100000; // Hack to force read of byte length
+	dev_cam->cam_ctrl1.cam_rec_data_bytelen = 40000; // Hack to force read of byte length
 
 	dev_cam->cam_ctrl.cam_update = 1;
 

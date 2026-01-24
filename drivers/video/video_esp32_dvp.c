@@ -35,7 +35,6 @@
 
 LOG_MODULE_REGISTER(video_esp32_lcd_cam, CONFIG_VIDEO_LOG_LEVEL);
 
-#define VIDEO_ESP32_DMA_BUFFER_MAX_SIZE 4092
 #define VIDEO_ESP32_VSYNC_MASK          0x04
 
 
@@ -84,7 +83,7 @@ struct video_esp32_data {
 	struct k_fifo fifo_in;
 	struct k_fifo fifo_out;
 	struct video_buffer *reload_on_vsync;
-	struct dma_block_config dma_blocks[CONFIG_DMA_ESP32_MAX_DESCRIPTOR_NUM];
+	struct dma_block_config dma_block;
 	uint32_t frame_count;
 #ifdef CONFIG_POLL
 	struct k_poll_signal *signal_out;
@@ -151,12 +150,12 @@ static int get_jpeg_size(struct video_buffer *vbuf)
 		}
 	}
 	LOG_INF("Non-zero bytes in buffer: %zu / %zu", non_zero_count, max_size);
-	
+
 	/* Find JPEG Start of Image marker (0xFFD8) */
 	for (size_t i = 0; i < max_size - 1; i++) {
 		if (buffer[i] == 0xFF && buffer[i + 1] == 0xD8) {
 			jpeg_start = i;
-			//LOG_INF("Found SOI at offset %zu", i);
+			LOG_INF("Found SOI marker at offset %zu", i);
 			break;
 		}
 	}
@@ -165,30 +164,73 @@ static int get_jpeg_size(struct video_buffer *vbuf)
 		LOG_ERR("JPEG SOI marker (0xFFD8) not found");
 		return -1;
 	}
-	
-	/* Scan for JPEG End of Image marker (0xFFD9) starting from SOI */
-	for (size_t i = jpeg_start; i < max_size - 1; i++) {
-		if (buffer[i] == 0xFF && buffer[i + 1] == 0xD9) {
-			/* Found EOI marker, include the 2-byte marker */
-			jpeg_end = i + 2;
-			break;
+
+	// Scan for JPEG markers and EOI
+	size_t i = jpeg_start + 2;
+	bool found_eoi = false;
+	while (i + 1 < max_size) {
+		if (buffer[i] == 0xFF) {
+			uint8_t marker = buffer[i + 1];
+			switch (marker) {
+				case 0xD9:
+					LOG_INF("Found EOI marker at offset %zu", i);
+					found_eoi = true;
+					break;
+				case 0xDA:
+					LOG_INF("Found SOS marker at offset %zu", i);
+					break;
+				case 0xE0:
+					LOG_INF("Found APP0 marker at offset %zu", i);
+					break;
+				case 0xDB:
+					LOG_INF("Found DQT marker at offset %zu", i);
+					break;
+				case 0xC4:
+					LOG_INF("Found DHT marker at offset %zu", i);
+					break;
+				case 0xC0:
+					LOG_INF("Found SOF0 marker at offset %zu", i);
+					break;
+				default:
+					// Other marker
+					break;
+			}
+			if (found_eoi) { // EOI
+				jpeg_end = i + 2;
+				break;
+			}
+			// Most markers have a length field after them (except SOI, EOI)
+			if (marker != 0xD8 && marker != 0xD9) {
+				if (i + 3 >= max_size) break;
+				uint16_t seglen = (buffer[i + 2] << 8) | buffer[i + 3];
+				i += 2 + seglen;
+			} else {
+				i += 2;
+			}
+		} else {
+			i++;
 		}
 	}
-	
-	/* If no EOI found, use full buffer */
-	if (jpeg_end == (size_t)-1) {
+
+	if (!found_eoi) {
 		LOG_ERR("JPEG EOI marker (0xFFD9) NOT FOUND - Image truncated!");
 		return -1;
-	} 
+	}
 	size_t jpeg_size = jpeg_end - jpeg_start;
 
 	/* If JPEG doesn't start at beginning, move it */
 	if (jpeg_start > 0) {
-		
 		LOG_WRN("Moving JPEG from offset %zu to beginning (%zu bytes)", jpeg_start, jpeg_size);
 		memmove(buffer, buffer + jpeg_start, jpeg_size);
 	}
 	vbuf->bytesused = jpeg_size;
+
+	if (found_eoi) {
+		LOG_INF("JPEG appears structurally valid (SOI/EOI found)");
+	} else {
+		LOG_ERR("JPEG missing EOI marker");
+	}
+
 	return jpeg_size;
 }
 
@@ -255,6 +297,10 @@ static int video_esp32_reload_dma(struct video_esp32_data *data)
 	// 	LOG_ERR("No video buffer available. Enqueue some buffers first.");
 	// 	return -EAGAIN;
 	// }
+	//cam_ll_fifo_reset(data->hal.hw);
+	// lcd_cam_dev_t *dev_cam = (lcd_cam_dev_t *)data->hal.hw;
+	// dev_cam->cam_ctrl1.cam_afifo_reset = 1;
+	// dev_cam->cam_ctrl.cam_update = 1;
 
 	ret = dma_reload(cfg->dma_dev, cfg->rx_dma_channel, 0, (uint32_t)data->active_vbuf->buffer,
 			 data->active_vbuf->size);
@@ -277,7 +323,7 @@ void video_esp32_dma_rx_done(const struct device *dev, void *user_data, uint32_t
 {
 	struct video_esp32_data *data = user_data;
 	data->frame_count++;
-	//LOG_ERR("DMA RX done with status: %d", status);
+	LOG_ERR("DMA RX done with status: %d", status);
 	//LOG_ERR("Should never occur because of circular DMA descriptors");
 
 	//get_jpeg_size(data->active_vbuf);
@@ -353,11 +399,12 @@ void video_esp32_dma_rx_done(const struct device *dev, void *user_data, uint32_t
 	// }
 
 	/* Discard the first 30 frames */
-	if (data->frame_count > 2 ) {
+	if (data->frame_count > 0 ) {
 		k_fifo_put(&data->fifo_out, data->active_vbuf);
 		VIDEO_ESP32_RAISE_OUT_SIG_IF_ENABLED(VIDEO_BUF_DONE)
 		data->active_vbuf = k_fifo_get(&data->fifo_in, K_NO_WAIT);
 
+		LOG_WRN("Captured frame %u", data->frame_count);
 		if (data->active_vbuf == NULL) {
 			LOG_WRN("Frame dropped. No buffer available");
 			//VIDEO_ESP32_RAISE_OUT_SIG_IF_ENABLED(VIDEO_BUF_ERROR)
@@ -366,6 +413,7 @@ void video_esp32_dma_rx_done(const struct device *dev, void *user_data, uint32_t
 		}
 	} else {
 		//memset(data->active_vbuf->buffer,0xFF, data->active_vbuf->size);
+		//LOG_WRN("Discarding frame %u", data->frame_count);
 	}
 	
 	video_esp32_reload_dma(data);
@@ -381,7 +429,6 @@ static int video_esp32_set_stream(const struct device *dev, bool enable, enum vi
 	struct video_esp32_data *data = dev->data;
 	struct dma_status dma_status = {0};
 	struct dma_config dma_cfg = {0};
-	struct dma_block_config *dma_block_iter = data->dma_blocks;
 	uint32_t buffer_size = 0;
 	int error = 0;
 
@@ -430,35 +477,17 @@ static int video_esp32_set_stream(const struct device *dev, bool enable, enum vi
 		return -EAGAIN;
 	}
 
-	buffer_size = data->active_vbuf->size;
-	memset(data->dma_blocks, 0, sizeof(data->dma_blocks));
-	for (int i = 0; i < CONFIG_DMA_ESP32_MAX_DESCRIPTOR_NUM; ++i) {
-		dma_block_iter->dest_address =
-			(uint32_t)data->active_vbuf->buffer + (i * VIDEO_ESP32_DMA_BUFFER_MAX_SIZE);
-		if (buffer_size < VIDEO_ESP32_DMA_BUFFER_MAX_SIZE) {
-			dma_block_iter->block_size = buffer_size;
-			dma_block_iter->next_block = NULL;
-			dma_cfg.block_count = i + 1;
-			break;
-		}
-		dma_block_iter->block_size = VIDEO_ESP32_DMA_BUFFER_MAX_SIZE;
-		dma_block_iter->next_block = dma_block_iter + 1;
-		dma_block_iter++;
-		buffer_size -= VIDEO_ESP32_DMA_BUFFER_MAX_SIZE;
-	}
-
-	if (dma_block_iter->next_block) {
-		LOG_ERR("Not enough descriptors available. Increase "
-			"CONFIG_DMA_ESP32_MAX_DESCRIPTOR_NUM");
-		return -ENOBUFS;
-	}
+	/* May use dynamic allocation of descriptors for large DMA data transfer */
+	memset(&data->dma_block, 0, sizeof(data->dma_block));
+	data->dma_block.block_size = data->active_vbuf->size;
+	data->dma_block.dest_address = (uint32_t)data->active_vbuf->buffer;
 
 	dma_cfg.channel_direction = PERIPHERAL_TO_MEMORY;
 	dma_cfg.dma_callback = video_esp32_dma_rx_done;
 	dma_cfg.user_data = data;
 	dma_cfg.dma_slot = SOC_GDMA_TRIG_PERIPH_CAM0;
 	dma_cfg.complete_callback_en = 1;
-	dma_cfg.head_block = &data->dma_blocks[0];
+	dma_cfg.head_block = &data->dma_block;
 	// dma_cfg.dest_burst_length = 4;
 	// dma_cfg.source_burst_length = 4;
 
@@ -489,25 +518,35 @@ static int video_esp32_set_stream(const struct device *dev, bool enable, enum vi
 	print_camera_registers(hal);	
 
 
-	print_gdma_registers(0x6003f000, 1);
+	//print_gdma_registers(0x6003f000, 1);
 	LOG_WRN("Alexanders hacking starts here");
 	// lcd_cam_lc_dma_int_ena_reg_t *lcd_cam_lc_dma_int_ena_reg = (lcd_cam_lc_dma_int_ena_reg_t *)&(hal->hw->lc_dma_int_ena.val);
 	// lcd_cam_cam_ctrl_reg_t *cam_ctrl = (lcd_cam_cam_ctrl_reg_t *)&(hal->hw->cam_ctrl.val);
 	// lcd_cam_cam_ctrl1_reg_t *cam_ctrl1 = (lcd_cam_cam_ctrl1_reg_t *)&(hal->hw->cam_ctrl1.val);
 	// lcd_cam_lc_dma_int_ena_reg->lcd_trans_done_int_ena.val = 0;
 
-	cam_ll_enable_vsync_filter(data->hal.hw, true);
+	//cam_ll_enable_vsync_filter(data->hal.hw, true);
 	lcd_cam_dev_t *dev_cam = (lcd_cam_dev_t *)hal->hw;
 	//dev_cam->lc_dma_int_ena.val = 0;
 	//dev_cam->lc_dma_int_ena.cam_vsync_int_ena = 0;
-	dev_cam->cam_ctrl.cam_vsync_filter_thres = 0x0003; // Reduce VSYNC filter threshold to 3 cycles
+	//dev_cam->cam_ctrl.cam_vsync_filter_thres = 0x0003; // Reduce VSYNC filter threshold to 3 cycles
+	dev_cam->lc_dma_int_ena.cam_vsync_int_ena = 1;
+
+	if (1) {
+		LOG_WRN("Enabling VSYNC interrupt");	
+		dev_cam->cam_ctrl.cam_vs_eof_en = 0;
+		dev_cam->cam_ctrl1.cam_rec_data_bytelen = 0xFFFF; // Hack to force read of byte length
+	} else {
+		LOG_WRN("Disabling VSYNC interrupt");
+		dev_cam->cam_ctrl.cam_vs_eof_en = 1;
+		// The largest buffer byte length is 65535 due to counter being 16 bits.
+		dev_cam->cam_ctrl1.cam_rec_data_bytelen = 0xFFFF; // Hack to force read of byte length
+	}
 	
-	//dev_cam->cam_ctrl.cam_vs_eof_en = 1;
-	//dev_cam->cam_ctrl1.cam_rec_data_bytelen = 0; // Hack to force read of byte length
+	
 
 
-	dev_cam->cam_ctrl.cam_vs_eof_en = 0;
-	dev_cam->cam_ctrl1.cam_rec_data_bytelen = 0xFFFFFFFF; // Hack to force read of byte length
+	//dev_cam->cam_ctrl.cam_vs_eof_en = 0;
 
 	dev_cam->cam_ctrl.cam_update = 1;
 
@@ -526,20 +565,17 @@ static int video_esp32_set_stream(const struct device *dev, bool enable, enum vi
 	// cam_ctrl1->cam_rec_data_bytelen = 6000; // Hack to force read of byte length
 	// LOG_WRN("Alexanders hacking ends here");
 
-	LOG_WRN("Registers while initializing:");
-	print_camera_registers(&data->hal);	
+	// LOG_WRN("Registers while initializing:");
+	// print_camera_registers(&data->hal);	
 
 	cam_hal_start_streaming(&data->hal);
-	dev_cam->cam_ctrl.cam_update = 1;	
+	
 
 
 
 
 
 	data->is_streaming = true;
-
-	LOG_WRN("Registers while running:");
-	print_camera_registers(&data->hal);
 
 	return 0;
 }

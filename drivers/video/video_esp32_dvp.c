@@ -132,7 +132,35 @@ static void print_gdma_registers(gdma_dev_t *gdma_dev, uint8_t channel) {
 	print_register_info(&(gdma_dev->channel[channel].in.link.val), "in_link");
 }
 
+static int bytes_received(struct video_buffer *vbuf)
+{
+       uint8_t *buffer = (uint8_t *)vbuf->buffer;
+       size_t max_size = vbuf->size;
 
+       size_t count = 0;
+       size_t first_data_loc = 0;
+       size_t last_data_loc = 0;
+       for (size_t i = 0; i < max_size; i++) {
+               if (buffer[i] != 0xFF) {
+                       last_data_loc = i;
+                       if (first_data_loc == 0) {
+                               first_data_loc = i;
+                       }
+                       count++;
+               }
+       }
+
+       LOG_HEXDUMP_INF((uint8_t*)(vbuf->buffer), 32, "First 32 bytes:");
+       if(first_data_loc >= 16) {
+               LOG_HEXDUMP_INF((uint8_t*)(vbuf->buffer) + first_data_loc - 16, 32, "Start 16 bytes:");
+       }
+       LOG_HEXDUMP_INF((uint8_t*)(vbuf->buffer) + last_data_loc - 16, 32, "End 16 bytes:");
+
+
+       LOG_ERR("First data byte at offset %zu, last data byte at offset %zu", first_data_loc, last_data_loc);
+       LOG_WRN("Non-zero bytes in buffer: %zu / %zu", count, max_size);
+       return count;
+}
 
 static int get_jpeg_size(struct video_buffer *vbuf)
 {
@@ -143,13 +171,7 @@ static int get_jpeg_size(struct video_buffer *vbuf)
 	size_t non_zero_count = 0;
 	vbuf->bytesused = 0;
 	
-	/* Count non-zero bytes */
-	for (size_t i = 0; i < max_size; i++) {
-		if (buffer[i] != 0xFF) {
-			non_zero_count++;
-		}
-	}
-	LOG_INF("Non-zero bytes in buffer: %zu / %zu", non_zero_count, max_size);
+	bytes_received(vbuf);
 
 	/* Find JPEG Start of Image marker (0xFFD8) */
 	for (size_t i = 0; i < max_size - 1; i++) {
@@ -488,8 +510,8 @@ static int video_esp32_set_stream(const struct device *dev, bool enable, enum vi
 	dma_cfg.dma_slot = SOC_GDMA_TRIG_PERIPH_CAM0;
 	dma_cfg.complete_callback_en = 1;
 	dma_cfg.head_block = &data->dma_block;
-	// dma_cfg.dest_burst_length = 4;
-	// dma_cfg.source_burst_length = 4;
+	//dma_cfg.dest_burst_length = 4;
+	//dma_cfg.source_burst_length = 4;
 
 	data->frame_count = 0;
 
@@ -534,11 +556,11 @@ static int video_esp32_set_stream(const struct device *dev, bool enable, enum vi
 
 	if (1) {
 		LOG_WRN("Enabling VSYNC interrupt");	
-		dev_cam->cam_ctrl.cam_vs_eof_en = 0;
-		dev_cam->cam_ctrl1.cam_rec_data_bytelen = 0xFFFF; // Hack to force read of byte length
-	} else {
-		LOG_WRN("Disabling VSYNC interrupt");
 		dev_cam->cam_ctrl.cam_vs_eof_en = 1;
+		dev_cam->cam_ctrl1.cam_rec_data_bytelen = 0; // Hack to force read of byte length
+	} else {
+		LOG_WRN("Getting data by size.");
+		dev_cam->cam_ctrl.cam_vs_eof_en = 0;
 		// The largest buffer byte length is 65535 due to counter being 16 bits.
 		dev_cam->cam_ctrl1.cam_rec_data_bytelen = 0xFFFF; // Hack to force read of byte length
 	}
@@ -721,6 +743,9 @@ static int video_esp32_dequeue(const struct device *dev, struct video_buffer **v
 	/* For JPEG format, calculate actual size from buffer */
 	if (data->video_format.pixelformat == VIDEO_PIX_FMT_JPEG) {
 		get_jpeg_size((*vbuf));
+	} else {
+		(*vbuf)->bytesused = data->video_format.pitch * data->video_format.height;
+		bytes_received(*vbuf);
 	}
 
 	LOG_WRN("Dequeue done, vbuf = %p, bytesused %zu", *vbuf, (*vbuf)->bytesused);

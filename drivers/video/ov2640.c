@@ -556,7 +556,6 @@ static int ov2640_write_all(const struct device *dev,
 			return err;
 		}
 	}
-
 	return 0;
 }
 
@@ -829,6 +828,31 @@ uint8_t ov2640_check_connection(const struct device *dev)
 	return ret;
 }
 
+static int alexander_hacks(const struct device *dev)
+{
+	int ret = 0;
+	const struct ov2640_config *cfg = dev->config;
+
+	LOG_ERR("10. --> Alexander's hacking again.. camera initialization tweak");
+
+	/* Switch to DSP register bank */
+	ret |= ov2640_write_reg(&cfg->i2c, BANK_SEL, BANK_SEL_DSP); // Setting from Table 12.
+	//ov2640_write_reg(&cfg->i2c, R_BYPASS, 0x00); // Bypass DSP
+	
+	/* Switch to Sensor register bank */
+	ret |= ov2640_write_reg(&cfg->i2c, BANK_SEL, BANK_SEL_SENSOR); // Setting from Table 13.
+	//uint8_t reg = ov2640_read_reg(&cfg->i2c, COM10);
+	//print_register("COM10", COM10, reg);	
+
+	//ov2640_write_reg(&cfg->i2c, COM10, 0x28); // <<-- No COM10, control logic settings improvement seen.
+	//ov2640_write_reg(&cfg->i2c, COM1, 0xCF); // Dummy frames, no improvement.
+
+	//ov2640_write_reg(&cfg->i2c, COM3, 0x01); // Single frame mode (does not help)
+
+
+	return ret;
+}
+
 static int ov2640_set_fmt(const struct device *dev, struct video_format *fmt)
 {
 	struct ov2640_data *drv_data = dev->data;
@@ -861,6 +885,7 @@ static int ov2640_set_fmt(const struct device *dev, struct video_format *fmt)
 			fmts[i].pixelformat == fmt->pixelformat) {
 			/* Set window size */
 			ret |= ov2640_set_resolution(dev, fmt->width, fmt->height);
+			alexander_hacks(dev);
 			return ret;
 		}
 		i++;

@@ -234,9 +234,9 @@ static int dma_esp32_config_descriptor(struct dma_esp32_channel *dma_channel,
 				dma_channel->dynamic_desc = NULL;
 				return -EINVAL;
 			}
-			LOG_INF("Descriptor %d: buffer %p, size %d", i,
-				dma_channel->dynamic_desc[i].buffer,
-				dma_channel->dynamic_desc[i].dw0.size);
+			// LOG_INF("Descriptor %d: buffer %p, size %d", i,
+			// 	dma_channel->dynamic_desc[i].buffer,
+			// 	dma_channel->dynamic_desc[i].dw0.size);
 		}
 		return 0;
 	}
